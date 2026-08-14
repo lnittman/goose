@@ -20,6 +20,10 @@ static TEMPLATE_REGISTRY: &[(&str, &str)] = &[
         "Renders the structured compaction output into the post-compaction context",
     ),
     (
+        "compaction_prefix.md",
+        "Compaction instruction appended to the conversation's own request prefix (cache-prefix compaction)",
+    ),
+    (
         "subagent_system.md",
         "System prompt for subagents spawned to handle specific tasks",
     ),

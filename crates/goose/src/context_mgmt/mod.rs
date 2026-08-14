@@ -1,8 +1,13 @@
 pub use goose_context_management::structured;
 
+pub mod request_header;
+
 use crate::conversation::message::MessageMetadata;
 use crate::conversation::message::{Message, MessageContent};
-use crate::conversation::{merge_consecutive_messages, Conversation};
+use crate::conversation::{
+    fix_conversation, merge_consecutive_messages, merge_consecutive_messages_for_request,
+    Conversation,
+};
 use crate::providers::base::Provider;
 #[cfg(test)]
 use crate::providers::base::{stream_from_single_message, MessageStream};
@@ -28,6 +33,12 @@ pub(crate) fn tool_pair_summarization_enabled() -> bool {
     Config::global()
         .get_param::<bool>("GOOSE_TOOL_PAIR_SUMMARIZATION")
         .unwrap_or(true)
+}
+
+pub(crate) fn cache_prefix_compaction_enabled() -> bool {
+    Config::global()
+        .get_param::<bool>("GOOSE_COMPACTION_CACHE_PREFIX")
+        .unwrap_or(false)
 }
 
 const CONVERSATION_CONTINUATION_TEXT: &str =
@@ -299,6 +310,26 @@ impl goose_context_management::CompactionModel for GooseCompactionModel<'_> {
         )
         .await
     }
+
+    async fn complete_prefix(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[rmcp::model::Tool],
+    ) -> Result<(Message, ProviderUsage), ProviderError> {
+        // Cache on and thinking inherited: both are part of the provider's
+        // cache key.
+        let model_config = self
+            .model_config
+            .clone()
+            .with_default_thinking_effort(Config::global().get_goose_thinking_effort());
+        crate::session_context::with_session_id(
+            Some(self.session_id.to_string()),
+            self.provider
+                .complete(&model_config, system, messages, tools),
+        )
+        .await
+    }
 }
 
 struct GooseTokenEstimator;
@@ -306,8 +337,18 @@ struct GooseTokenEstimator;
 #[async_trait::async_trait]
 impl goose_context_management::TokenEstimator for GooseTokenEstimator {
     async fn count_chat_tokens(&self, system: &str, messages: &[Message]) -> usize {
+        self.count_chat_tokens_with_tools(system, messages, &[])
+            .await
+    }
+
+    async fn count_chat_tokens_with_tools(
+        &self,
+        system: &str,
+        messages: &[Message],
+        tools: &[rmcp::model::Tool],
+    ) -> usize {
         match create_token_counter().await {
-            Ok(counter) => counter.count_chat_tokens(system, messages, &[]),
+            Ok(counter) => counter.count_chat_tokens(system, messages, tools),
             Err(error) => {
                 warn!("Failed to create token counter: {error}");
                 0
@@ -339,6 +380,18 @@ async fn do_compact(
     session_id: &str,
     messages: &[Message],
 ) -> Result<(Message, ProviderUsage), anyhow::Error> {
+    let model = GooseCompactionModel {
+        provider,
+        model_config,
+        session_id,
+    };
+
+    let (prefix_summary, rejected_prefix_usage) =
+        try_summarize_as_prefix(provider, model_config, session_id, messages, &model).await;
+    if let Some(summary) = prefix_summary {
+        return Ok((summary.message, summary.usage));
+    }
+
     // Keep stale per-turn state out of the summary.
     let agent_visible_messages = Conversation::new_unvalidated(
         messages
@@ -348,12 +401,7 @@ async fn do_compact(
     )
     .agent_visible_messages();
 
-    let model = GooseCompactionModel {
-        provider,
-        model_config,
-        session_id,
-    };
-    let summary = goose_context_management::summarize(
+    let mut summary = goose_context_management::summarize(
         &model,
         Some(&GooseTokenEstimator),
         &compaction_templates()?,
@@ -361,7 +409,91 @@ async fn do_compact(
     )
     .await?;
 
+    // A completed-but-rejected prefix attempt was still billed.
+    if let Some(rejected) = rejected_prefix_usage {
+        summary.usage.usage += rejected.usage;
+        summary.usage.cost = match (summary.usage.cost, rejected.cost) {
+            (Some(fallback), Some(rejected)) => Some(fallback + rejected),
+            (fallback, rejected) => fallback.or(rejected),
+        };
+        summary.usage.cost_source = summary.usage.cost_source.or(rejected.cost_source);
+    }
+
     Ok((summary.message, summary.usage))
+}
+
+/// Replays the last routed request's prefix with the compaction instruction
+/// as the final user message. `(None, _)` means fall back to the standalone
+/// shape; the second element carries a rejected attempt's billed usage.
+async fn try_summarize_as_prefix(
+    provider: &dyn Provider,
+    model_config: &ModelConfig,
+    session_id: &str,
+    messages: &[Message],
+    model: &GooseCompactionModel<'_>,
+) -> (
+    Option<goose_context_management::Summary>,
+    Option<ProviderUsage>,
+) {
+    if !cache_prefix_compaction_enabled() || model_config.toolshim {
+        return (None, None);
+    }
+    // A different summarizer model shares no cache prefix with the
+    // conversation.
+    let Ok(compaction_model) =
+        crate::model_config::get_compaction_model(provider.get_name(), model_config)
+    else {
+        return (None, None);
+    };
+    if compaction_model.model_name != model_config.model_name {
+        return (None, None);
+    }
+    let Some(header) = request_header::last_for_session(session_id) else {
+        return (None, None);
+    };
+    // A header from a different provider or model shares no cache.
+    if header.provider_name != provider.get_name() || header.model_name != model_config.model_name {
+        return (None, None);
+    }
+
+    let Ok(instruction) = crate::prompt_template::template_source(
+        goose_context_management::templates::COMPACTION_PREFIX_TEMPLATE,
+    ) else {
+        return (None, None);
+    };
+    let Ok(summary_template) = crate::prompt_template::template_source(
+        goose_context_management::templates::COMPACTION_SUMMARY_TEMPLATE,
+    ) else {
+        return (None, None);
+    };
+
+    // Same projection as `stream_response_from_provider`; the instruction is
+    // appended before the merge pass to keep role alternation valid.
+    let mut projected =
+        Conversation::new_unvalidated(messages.iter().cloned()).agent_visible_messages();
+    projected.push(Message::user().with_text(&instruction));
+    let (fixed, _) = fix_conversation(Conversation::new_unvalidated(projected));
+    let request_messages = merge_consecutive_messages_for_request(fixed.messages().clone());
+
+    match goose_context_management::summarize_as_prefix(
+        model,
+        Some(&GooseTokenEstimator),
+        &summary_template,
+        &header.system_prompt,
+        &header.tools,
+        &request_messages,
+    )
+    .await
+    {
+        Ok(summary) => (Some(summary), None),
+        Err(failure) => {
+            warn!(
+                "Cache-prefix compaction failed, falling back to the standalone shape: {}",
+                failure.error
+            );
+            (None, failure.usage)
+        }
+    }
 }
 
 pub use goose_context_management::format_message_for_compacting;

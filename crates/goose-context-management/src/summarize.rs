@@ -2,7 +2,7 @@ use anyhow::Result;
 use goose_providers::conversation::message::{Message, MessageContent};
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
-use rmcp::model::Role;
+use rmcp::model::{Role, Tool};
 use serde::Serialize;
 use tracing::warn;
 
@@ -96,10 +96,13 @@ async fn ensure_usage_tokens(
     estimator: &dyn TokenEstimator,
     system_prompt: &str,
     request: &[Message],
+    tools: &[Tool],
     response: &Message,
 ) {
     if usage.usage.input_tokens.is_none() {
-        let count = estimator.count_chat_tokens(system_prompt, request).await;
+        let count = estimator
+            .count_chat_tokens_with_tools(system_prompt, request, tools)
+            .await;
         usage.usage.input_tokens = Some(count as i32);
     }
     if usage.usage.output_tokens.is_none() {
@@ -115,6 +118,78 @@ async fn ensure_usage_tokens(
     if let (Some(input), Some(output)) = (usage.usage.input_tokens, usage.usage.output_tokens) {
         usage.usage.total_tokens = Some(input + output);
     }
+}
+
+/// A failed prefix attempt; carries the billed usage of a
+/// completed-but-rejected call.
+pub struct PrefixFailure {
+    pub error: anyhow::Error,
+    pub usage: Option<ProviderUsage>,
+}
+
+/// Summarizes by replaying the conversation's own request prefix (system,
+/// tools, messages as the provider last saw them, instruction last) so the
+/// provider's prompt cache is reused. No overflow retry ladder: the caller
+/// falls back on any failure.
+pub async fn summarize_as_prefix(
+    model: &dyn CompactionModel,
+    estimator: Option<&dyn TokenEstimator>,
+    summary_template: &str,
+    system: &str,
+    tools: &[Tool],
+    request_messages: &[Message],
+) -> Result<Summary, PrefixFailure> {
+    let (mut response, mut usage) = model
+        .complete_prefix(system, request_messages, tools)
+        .await
+        .map_err(|error| PrefixFailure {
+            error: error.into(),
+            usage: None,
+        })?;
+
+    // Estimate before the rejection checks so rejected usage is still
+    // complete.
+    if let Some(estimator) = estimator {
+        ensure_usage_tokens(
+            &mut usage,
+            estimator,
+            system,
+            request_messages,
+            tools,
+            &response,
+        )
+        .await;
+    }
+
+    if response
+        .content
+        .iter()
+        .any(|content| matches!(content, MessageContent::ToolRequest(_)))
+    {
+        return Err(PrefixFailure {
+            error: anyhow::anyhow!("summarizer called a tool instead of producing a summary"),
+            usage: Some(usage),
+        });
+    }
+    if response.as_concat_text().trim().is_empty() {
+        return Err(PrefixFailure {
+            error: anyhow::anyhow!("summarization produced no text content"),
+            usage: Some(usage),
+        });
+    }
+
+    response.role = Role::User;
+    // The session may run with extended thinking; only the text carries the
+    // summary.
+    response
+        .content
+        .retain(|content| matches!(content, MessageContent::Text(_)));
+    apply_structured_summary(&mut response, summary_template);
+
+    Ok(Summary {
+        message: response,
+        usage,
+    })
 }
 
 /// Summarizes `messages` into a single user-role message, retrying with
@@ -147,8 +222,15 @@ pub async fn summarize(
                 // so estimate before the response is rewritten to the smaller
                 // rendered summary.
                 if let Some(estimator) = estimator {
-                    ensure_usage_tokens(&mut usage, estimator, &system_prompt, &request, &response)
-                        .await;
+                    ensure_usage_tokens(
+                        &mut usage,
+                        estimator,
+                        &system_prompt,
+                        &request,
+                        &[],
+                        &response,
+                    )
+                    .await;
                 }
 
                 apply_structured_summary(&mut response, &templates.summary);
