@@ -1,5 +1,6 @@
 use super::message_meta::{
-    content_chunk_for_message, merge_message_meta, populate_output_token_limit_content,
+    content_chunk_for_message, merge_message_meta, message_meta_without_steer,
+    populate_output_token_limit_content,
 };
 use super::tool_calls::conversion::{
     build_initial_tool_call_with_message_meta, tool_call_update_fields_from_response,
@@ -45,6 +46,54 @@ fn active_turn_messages(conversation: &Conversation) -> &[Message] {
         })
         .map(|start| &messages[start..])
         .unwrap_or(messages)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PendingFormElicitation {
+    id: String,
+    message: String,
+    requested_schema: serde_json::Value,
+    meta: Meta,
+}
+
+fn pending_form_elicitations(messages: &[Message]) -> Vec<PendingFormElicitation> {
+    let answered = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            MessageContent::ActionRequired(action) => match &action.data {
+                ActionRequiredData::ElicitationResponse { id, .. } => Some(id.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    messages
+        .iter()
+        .flat_map(|message| {
+            let answered = &answered;
+            message.content.iter().filter_map(move |content| {
+                let MessageContent::ActionRequired(action) = content else {
+                    return None;
+                };
+                let ActionRequiredData::Elicitation {
+                    id,
+                    message: elicitation_message,
+                    requested_schema,
+                } = &action.data
+                else {
+                    return None;
+                };
+                (!answered.contains(id.as_str())).then(|| PendingFormElicitation {
+                    id: id.clone(),
+                    message: elicitation_message.clone(),
+                    requested_schema: requested_schema.clone(),
+                    meta: message_meta_without_steer(message),
+                })
+            })
+        })
+        .collect()
 }
 
 fn send_replay_content_chunk(
@@ -266,6 +315,38 @@ impl GooseAcpAgent {
         Ok(())
     }
 
+    async fn resend_pending_form_elicitations(
+        &self,
+        cx: &ConnectionTo<Client>,
+        agent: &Arc<Agent>,
+        session: &Session,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let session_id = SessionId::new(session.id.clone());
+        let messages = session
+            .conversation
+            .as_ref()
+            .map(active_turn_messages)
+            .unwrap_or(&[]);
+
+        for pending in pending_form_elicitations(messages) {
+            self.handle_form_elicitation(
+                cx,
+                agent,
+                FormElicitation::new(
+                    session_id.clone(),
+                    pending.id,
+                    pending.message,
+                    pending.requested_schema,
+                    pending.meta,
+                    true,
+                ),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     pub(super) async fn handle_load_session(
         &self,
         cx: &ConnectionTo<Client>,
@@ -300,6 +381,8 @@ impl GooseAcpAgent {
         self.register_acp_session(session_id_str.clone(), agent.clone())
             .await;
         self.resend_pending_tool_permissions(cx, &agent, &session)?;
+        self.resend_pending_form_elicitations(cx, &agent, &session)
+            .await?;
 
         session = self
             .session_manager
@@ -482,5 +565,40 @@ mod tests {
 
         let no_kickoff = Conversation::new_unvalidated([approval("orphan")]);
         assert_eq!(active_turn_messages(&no_kickoff).len(), 1);
+    }
+
+    #[test]
+    fn pending_form_elicitations_recover_only_unanswered_current_turn_requests() {
+        let request = |id: &str, prompt: &str| {
+            Message::assistant().with_content(MessageContent::action_required_elicitation(
+                id.to_string(),
+                prompt.to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "string" } }
+                }),
+            ))
+        };
+        let response = |id: &str| {
+            Message::user().with_content(MessageContent::action_required_elicitation_response(
+                id.to_string(),
+                serde_json::json!({ "answer": "done" }),
+                rmcp::model::ElicitationAction::Accept,
+            ))
+        };
+        let conversation = Conversation::new_unvalidated([
+            Message::user().with_text("old turn"),
+            request("old", "Old question"),
+            Message::user().with_text("current turn"),
+            request("answered", "Answered question"),
+            response("answered"),
+            request("pending", "Pending question"),
+        ]);
+
+        let pending = pending_form_elicitations(active_turn_messages(&conversation));
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "pending");
+        assert_eq!(pending[0].message, "Pending question");
     }
 }

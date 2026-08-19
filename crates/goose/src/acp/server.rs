@@ -96,6 +96,7 @@ mod diagnostics;
 mod dictation;
 mod dispatch;
 mod elicitation;
+use self::elicitation::FormElicitation;
 mod extensions;
 mod fork_session;
 mod list_sessions;
@@ -1130,11 +1131,15 @@ impl GooseAcpAgent {
                 } => {
                     self.handle_form_elicitation(
                         cx,
-                        session_id,
-                        id,
-                        elicitation_message,
-                        requested_schema,
-                        message_meta_without_steer(message),
+                        agent,
+                        FormElicitation::new(
+                            session_id.clone(),
+                            id.clone(),
+                            elicitation_message.clone(),
+                            requested_schema.clone(),
+                            message_meta_without_steer(message),
+                            false,
+                        ),
                     )
                     .await?;
                 }

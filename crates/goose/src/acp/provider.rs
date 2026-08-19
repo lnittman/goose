@@ -1,13 +1,15 @@
 use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
-    ContentChunk, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, Role as AcpRole, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallContent,
-    ToolCallStatus, ToolKind,
+    ContentChunk, CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
+    ElicitationAction as AcpElicitationAction, ElicitationCapabilities, ElicitationContentValue,
+    ElicitationFormCapabilities, ElicitationMode, EnvVariable, HttpHeader, ImageContent,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, McpCapabilities, McpServer,
+    McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    Role as AcpRole, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCallContent, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo};
@@ -17,8 +19,11 @@ use anyhow::{Context, Result};
 use async_stream::try_stream;
 use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
-use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock as RmcpContent, Role, Tool};
-use std::collections::{HashMap, HashSet};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ContentBlock as RmcpContent,
+    ElicitationAction as McpElicitationAction, Role, Tool,
+};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -32,10 +37,13 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
+use crate::acp::cursor::{CursorAskQuestionRequest, CursorAskQuestionResponse};
 use crate::acp::handoff::{build_handoff_context_memo, memo_token_budget, prompt_token_cost};
 use crate::acp::{map_permission_response, PermissionDecision};
 use crate::config::{ExtensionConfig, GooseMode};
-use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
+use crate::conversation::message::{
+    ActionRequiredData, Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY,
+};
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
 use crate::providers::base::{MessageStream, PermissionRouting, Provider};
@@ -47,6 +55,26 @@ use goose_providers::model::ModelConfig;
 
 /// Sentinel: resolved to the actual model name during connect().
 pub const ACP_CURRENT_MODEL: &str = "current";
+pub(crate) const ACP_PROVIDER_ELICITATION_ID_PREFIX: &str = "acp-provider:";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpClientExtension {
+    CursorAskQuestion,
+}
+
+pub(crate) fn is_provider_form_elicitation(message: &Message) -> bool {
+    message.content.iter().any(|content| {
+        matches!(
+            content,
+            MessageContent::ActionRequired(action)
+                if matches!(
+                    &action.data,
+                    ActionRequiredData::Elicitation { id, .. }
+                        if id.starts_with(ACP_PROVIDER_ELICITATION_ID_PREFIX)
+                )
+        )
+    })
+}
 
 pub struct AcpProviderConfig {
     pub command: PathBuf,
@@ -148,6 +176,10 @@ enum AcpUpdate {
         request: Box<RequestPermissionRequest>,
         response_tx: oneshot::Sender<RequestPermissionResponse>,
     },
+    ElicitationRequest {
+        request: Box<CreateElicitationRequest>,
+        response_tx: oneshot::Sender<CreateElicitationResponse>,
+    },
     Complete(StopReason, Option<AcpUsage>),
     Error(agent_client_protocol::Error),
 }
@@ -239,6 +271,7 @@ pub struct AcpProvider {
 
     pending_confirmations:
         Arc<TokioMutex<HashMap<String, oneshot::Sender<PermissionConfirmation>>>>,
+    pending_elicitations: Arc<Mutex<HashMap<String, oneshot::Sender<CreateElicitationResponse>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     /// True after the first ACP prompt completes with the handoff context committed.
     /// Failed or abandoned first prompts reset this so the next prompt can retry it.
@@ -268,6 +301,26 @@ impl std::fmt::Debug for AcpProvider {
     }
 }
 
+fn cancel_pending_elicitations(
+    pending: &Mutex<HashMap<String, oneshot::Sender<CreateElicitationResponse>>>,
+) {
+    if let Ok(mut pending) = pending.lock() {
+        for (_, response_tx) in pending.drain() {
+            let _ = response_tx.send(CreateElicitationResponse::new(AcpElicitationAction::Cancel));
+        }
+    }
+}
+
+struct PendingElicitationGuard {
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<CreateElicitationResponse>>>>,
+}
+
+impl Drop for PendingElicitationGuard {
+    fn drop(&mut self) {
+        cancel_pending_elicitations(&self.pending);
+    }
+}
+
 fn spawn_client_loop(fut: impl Future<Output = ()> + Send + 'static) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -284,10 +337,20 @@ impl AcpProvider {
         goose_mode: GooseMode,
         config: AcpProviderConfig,
     ) -> Result<Self> {
+        Self::connect_with_client_extensions(name, goose_mode, config, Vec::new()).await
+    }
+
+    pub async fn connect_with_client_extensions(
+        name: String,
+        goose_mode: GooseMode,
+        config: AcpProviderConfig,
+        client_extensions: Vec<AcpClientExtension>,
+    ) -> Result<Self> {
         Self::start(
             name,
             goose_mode,
             config,
+            client_extensions,
             Box::new(|cl, rx, init_tx, mut cancel_rx| {
                 Box::pin(async move {
                     tokio::select! {
@@ -308,10 +371,23 @@ impl AcpProvider {
         config: AcpProviderConfig,
         transport: impl agent_client_protocol::ConnectTo<Client> + 'static,
     ) -> Result<Self> {
+        Self::connect_with_transport_and_extensions(name, goose_mode, config, transport, Vec::new())
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn connect_with_transport_and_extensions(
+        name: String,
+        goose_mode: GooseMode,
+        config: AcpProviderConfig,
+        transport: impl agent_client_protocol::ConnectTo<Client> + 'static,
+        client_extensions: Vec<AcpClientExtension>,
+    ) -> Result<Self> {
         Self::start(
             name,
             goose_mode,
             config,
+            client_extensions,
             Box::new(move |cl, mut rx, init_tx, mut cancel_rx| {
                 Box::pin(async move {
                     tokio::select! {
@@ -333,6 +409,7 @@ impl AcpProvider {
         name: String,
         goose_mode: GooseMode,
         config: AcpProviderConfig,
+        client_extensions: Vec<AcpClientExtension>,
         run: ClientLoopFn,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(32);
@@ -352,6 +429,7 @@ impl AcpProvider {
         let context_size = Arc::new(AtomicU64::new(0));
         let client_loop = AcpClientLoop::new(
             config,
+            client_extensions,
             goose_mode_shared.clone(),
             pending_tool_updates.clone(),
             context_size.clone(),
@@ -394,6 +472,7 @@ impl AcpProvider {
             mode_mapping,
             session: Mutex::new(session),
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
+            pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
             pending_tool_updates,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
@@ -581,6 +660,8 @@ impl Provider for AcpProvider {
             return Ok(());
         }
 
+        cancel_pending_elicitations(&self.pending_elicitations);
+
         let previous_session_id = self.acp_session_id();
         let loaded = self
             .load_session(SessionId::new(session_id))
@@ -657,6 +738,59 @@ impl Provider for AcpProvider {
             return true;
         }
         false
+    }
+
+    async fn handle_elicitation_response(
+        &self,
+        request_id: &str,
+        user_data: &serde_json::Value,
+        action: &McpElicitationAction,
+    ) -> bool {
+        let action = match action {
+            McpElicitationAction::Accept => {
+                let Some(values) = user_data.as_object() else {
+                    tracing::warn!(request_id, "ACP elicitation response is not an object");
+                    return false;
+                };
+                let mut content = BTreeMap::new();
+                for (key, value) in values {
+                    let Ok(value) =
+                        serde_json::from_value::<ElicitationContentValue>(value.clone())
+                    else {
+                        tracing::warn!(
+                            request_id,
+                            field = key,
+                            "ACP elicitation response contains an unsupported value"
+                        );
+                        return false;
+                    };
+                    content.insert(key.clone(), value);
+                }
+                AcpElicitationAction::Accept(ElicitationAcceptAction::new().content(content))
+            }
+            McpElicitationAction::Decline => AcpElicitationAction::Decline,
+            McpElicitationAction::Cancel => AcpElicitationAction::Cancel,
+            _ => AcpElicitationAction::Cancel,
+        };
+
+        let Some(response_tx) = self
+            .pending_elicitations
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(request_id))
+        else {
+            return false;
+        };
+
+        response_tx
+            .send(CreateElicitationResponse::new(action))
+            .is_ok()
+    }
+
+    async fn has_pending_elicitation(&self, request_id: &str) -> bool {
+        self.pending_elicitations
+            .lock()
+            .is_ok_and(|pending| pending.contains_key(request_id))
     }
 
     async fn stream(
@@ -737,6 +871,7 @@ impl Provider for AcpProvider {
             bare_retry_blocks.map(|blocks| (self.tx.as_ref().unwrap().clone(), session_id, blocks));
 
         let pending_confirmations = self.pending_confirmations.clone();
+        let pending_elicitations = self.pending_elicitations.clone();
         let goose_mode = *self
             .goose_mode
             .lock()
@@ -746,6 +881,9 @@ impl Provider for AcpProvider {
         let model_name = model_config.model_name.clone();
 
         Ok(Box::pin(try_stream! {
+            let _pending_elicitation_guard = PendingElicitationGuard {
+                pending: pending_elicitations.clone(),
+            };
             let mut suppress_text = false;
             let mut bare_retry = bare_retry;
             let mut updates_seen = 0usize;
@@ -877,6 +1015,32 @@ impl Provider for AcpProvider {
                         }
                         let _ = response_tx.send(map_permission_response(&request, decision));
                     }
+                    AcpUpdate::ElicitationRequest { request, response_tx } => {
+                        text_run = None;
+                        thought_run = None;
+
+                        let Some((request_id, action_required)) =
+                            build_action_required_elicitation_message(&request)
+                        else {
+                            let _ = response_tx.send(CreateElicitationResponse::new(
+                                AcpElicitationAction::Cancel,
+                            ));
+                            continue;
+                        };
+
+                        match pending_elicitations.lock() {
+                            Ok(mut pending) => {
+                                pending.insert(request_id, response_tx);
+                            }
+                            Err(_) => {
+                                let _ = response_tx.send(CreateElicitationResponse::new(
+                                    AcpElicitationAction::Cancel,
+                                ));
+                                continue;
+                            }
+                        }
+                        yield (Some(action_required), None);
+                    }
                     AcpUpdate::Complete(reason, usage) => {
                         // Prefer retrying context over silently losing it. A harness may have
                         // ingested the memo before cancelling or refusing, so a retry can duplicate
@@ -956,23 +1120,32 @@ impl Drop for AcpProvider {
 
 struct AcpClientLoop {
     config: AcpProviderConfig,
+    client_extensions: Vec<AcpClientExtension>,
     goose_mode: Arc<Mutex<GooseMode>>,
-    prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
+    active_prompt: Arc<Mutex<Option<ActivePrompt>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     context_size: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct ActivePrompt {
+    session_id: SessionId,
+    response_tx: mpsc::Sender<AcpUpdate>,
 }
 
 impl AcpClientLoop {
     fn new(
         config: AcpProviderConfig,
+        client_extensions: Vec<AcpClientExtension>,
         goose_mode: Arc<Mutex<GooseMode>>,
         pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
         context_size: Arc<AtomicU64>,
     ) -> Self {
         Self {
             config,
+            client_extensions,
             goose_mode,
-            prompt_response_tx: Arc::new(Mutex::new(None)),
+            active_prompt: Arc::new(Mutex::new(None)),
             pending_tool_updates,
             context_size,
         }
@@ -1025,19 +1198,22 @@ impl AcpClientLoop {
     ) -> Result<()> {
         let AcpClientLoop {
             config,
+            client_extensions,
             goose_mode,
-            prompt_response_tx,
+            active_prompt,
             pending_tool_updates,
             context_size,
         } = self;
         let notification_callback = config.notification_callback.clone();
+        let cursor_ask_question =
+            client_extensions.contains(&AcpClientExtension::CursorAskQuestion);
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
 
         Client
             .builder()
             .on_receive_notification(
                 {
-                    let prompt_response_tx = prompt_response_tx.clone();
+                    let active_prompt = active_prompt.clone();
                     let reverse_modes = reverse_modes.clone();
                     let goose_mode = goose_mode.clone();
                     let pending_tool_updates = pending_tool_updates.clone();
@@ -1080,11 +1256,12 @@ impl AcpClientLoop {
                             }
                             _ => {}
                         }
-                        if let Some(tx) = prompt_response_tx
+                        if let Some(tx) = active_prompt
                             .lock()
                             .ok()
                             .as_ref()
-                            .and_then(|g| g.as_ref())
+                            .and_then(|guard| guard.as_ref())
+                            .map(|prompt| &prompt.response_tx)
                         {
                             match notification.update {
                                 SessionUpdate::AgentMessageChunk(ContentChunk {
@@ -1205,17 +1382,18 @@ impl AcpClientLoop {
             )
             .on_receive_request(
                 {
-                    let prompt_response_tx = prompt_response_tx.clone();
+                    let active_prompt = active_prompt.clone();
                     async move |request: RequestPermissionRequest, responder, _connection_cx| {
                         let (response_tx, response_rx) = oneshot::channel();
 
-                        let handler = prompt_response_tx
+                        let handler = active_prompt
                             .lock()
                             .ok()
                             .as_ref()
                             .and_then(|g| g.as_ref().cloned());
-                        let tx =
-                            handler.ok_or_else(agent_client_protocol::Error::internal_error)?;
+                        let tx = handler
+                            .map(|prompt| prompt.response_tx)
+                            .ok_or_else(agent_client_protocol::Error::internal_error)?;
 
                         if tx.is_closed() {
                             return Err(agent_client_protocol::Error::internal_error());
@@ -1235,8 +1413,88 @@ impl AcpClientLoop {
                 },
                 agent_client_protocol::on_receive_request!(),
             )
+            .on_receive_request(
+                {
+                    let active_prompt = active_prompt.clone();
+                    async move |request: CreateElicitationRequest, responder, _connection_cx| {
+                        let (response_tx, response_rx) = oneshot::channel();
+
+                        let handler = active_prompt
+                            .lock()
+                            .ok()
+                            .as_ref()
+                            .and_then(|g| g.as_ref().cloned());
+                        let tx = handler
+                            .map(|prompt| prompt.response_tx)
+                            .ok_or_else(agent_client_protocol::Error::internal_error)?;
+
+                        if tx.is_closed() {
+                            return Err(agent_client_protocol::Error::internal_error());
+                        }
+
+                        tx.try_send(AcpUpdate::ElicitationRequest {
+                            request: Box::new(request),
+                            response_tx,
+                        })
+                        .map_err(|_| agent_client_protocol::Error::internal_error())?;
+
+                        let response = response_rx.await.unwrap_or_else(|_| {
+                            CreateElicitationResponse::new(AcpElicitationAction::Cancel)
+                        });
+                        responder.respond(response)
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let active_prompt = active_prompt.clone();
+                    async move |request: CursorAskQuestionRequest, responder, _connection_cx| {
+                        if !cursor_ask_question {
+                            return Err(agent_client_protocol::Error::method_not_found());
+                        }
+
+                        let handler = active_prompt
+                            .lock()
+                            .ok()
+                            .as_ref()
+                            .and_then(|guard| guard.as_ref().cloned());
+                        let Some(handler) = handler else {
+                            return responder.respond(CursorAskQuestionResponse::cancelled());
+                        };
+                        let Some(elicitation_request) =
+                            request.to_elicitation_request(handler.session_id.0.as_ref())
+                        else {
+                            tracing::warn!(
+                                tool_call_id = request.tool_call_id,
+                                "Cursor question request is malformed"
+                            );
+                            return responder.respond(CursorAskQuestionResponse::cancelled());
+                        };
+                        let (response_tx, response_rx) = oneshot::channel();
+                        let tx = handler.response_tx;
+
+                        if tx.is_closed()
+                            || tx
+                                .try_send(AcpUpdate::ElicitationRequest {
+                                    request: Box::new(elicitation_request),
+                                    response_tx,
+                                })
+                                .is_err()
+                        {
+                            return responder.respond(CursorAskQuestionResponse::cancelled());
+                        }
+
+                        let response = response_rx.await.unwrap_or_else(|_| {
+                            CreateElicitationResponse::new(AcpElicitationAction::Cancel)
+                        });
+                        responder.respond(request.response_from_elicitation(response))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
             .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
-                handle_requests(config, goose_mode, cx, rx, prompt_response_tx, init_tx).await
+                handle_requests(config, goose_mode, cx, rx, active_prompt, init_tx).await
             })
             .await?;
 
@@ -1338,12 +1596,13 @@ async fn handle_requests(
     goose_mode: Arc<Mutex<GooseMode>>,
     cx: ConnectionTo<Agent>,
     rx: &mut mpsc::Receiver<ClientRequest>,
-    prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
+    active_prompt: Arc<Mutex<Option<ActivePrompt>>>,
     init_tx: oneshot::Sender<Result<InitializeResponse>>,
 ) -> Result<(), agent_client_protocol::Error> {
     let mut init_tx = Some(init_tx);
 
-    let client_capabilities = ClientCapabilities::new();
+    let client_capabilities = ClientCapabilities::new()
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
     let init_response: InitializeResponse = cx
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1).client_capabilities(client_capabilities),
@@ -1478,7 +1737,10 @@ async fn handle_requests(
                 content,
                 response_tx,
             } => {
-                *prompt_response_tx.lock().unwrap() = Some(response_tx.clone());
+                *active_prompt.lock().unwrap() = Some(ActivePrompt {
+                    session_id: session_id.clone(),
+                    response_tx: response_tx.clone(),
+                });
 
                 let response: Result<PromptResponse, _> = cx
                     .send_request(PromptRequest::new(session_id, content))
@@ -1500,7 +1762,7 @@ async fn handle_requests(
                     }
                 }
 
-                *prompt_response_tx.lock().unwrap() = None;
+                *active_prompt.lock().unwrap() = None;
             }
         }
     }
@@ -1882,6 +2144,29 @@ fn build_action_required_message(request: &RequestPermissionRequest) -> Option<M
     )
 }
 
+fn build_action_required_elicitation_message(
+    request: &CreateElicitationRequest,
+) -> Option<(String, Message)> {
+    let ElicitationMode::Form(form) = &request.mode else {
+        return None;
+    };
+    let requested_schema = serde_json::to_value(&form.requested_schema).ok()?;
+    let request_id = format!(
+        "{}{}",
+        ACP_PROVIDER_ELICITATION_ID_PREFIX,
+        uuid::Uuid::new_v4()
+    );
+    let message = Message::assistant()
+        .with_content(MessageContent::action_required_elicitation(
+            request_id.clone(),
+            request.message.clone(),
+            requested_schema,
+        ))
+        .user_only();
+
+    Some((request_id, message))
+}
+
 fn extract_model_info_from_config_options(
     config_options: &[SessionConfigOption],
 ) -> Option<(String, Vec<String>)> {
@@ -1972,7 +2257,9 @@ mod tests {
     use super::*;
     use crate::agents::extension::Envs;
     use agent_client_protocol::schema::v1::{
-        ErrorCode, SessionConfigSelectOption, SessionMode, SessionModeId,
+        AgentCapabilities, ElicitationFormMode, ElicitationSchema, ElicitationSessionScope,
+        ErrorCode, MultiSelectPropertySchema, SessionConfigSelectOption, SessionMode,
+        SessionModeId,
     };
 
     use test_case::test_case;
@@ -2088,6 +2375,507 @@ mod tests {
         assert_eq!(error.data, Some(serde_json::json!("sign in")));
     }
 
+    #[tokio::test]
+    async fn stream_forwards_nested_form_elicitation_and_returns_response() {
+        use futures::StreamExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let (provider, model) = test_provider_with_tx(Some(tx));
+        let messages = vec![Message::user().with_text("ask me")];
+        let mut stream = provider.stream(&model, "", &messages, &[]).await.unwrap();
+
+        let prompt_tx = match rx.recv().await.expect("expected ACP prompt request") {
+            ClientRequest::Prompt { response_tx, .. } => response_tx,
+            _ => panic!("expected ACP prompt request"),
+        };
+        let request = CreateElicitationRequest::new(
+            ElicitationFormMode::new(
+                ElicitationSessionScope::new("nested-session"),
+                ElicitationSchema::new().string("answer", true),
+            ),
+            "Choose an answer",
+        );
+        let (response_tx, response_rx) = oneshot::channel();
+        prompt_tx
+            .send(AcpUpdate::ElicitationRequest {
+                request: Box::new(request),
+                response_tx,
+            })
+            .await
+            .unwrap();
+
+        let (message, usage) = stream.next().await.unwrap().unwrap();
+        assert!(usage.is_none());
+        let message = message.expect("expected action-required message");
+        assert!(is_provider_form_elicitation(&message));
+        let MessageContent::ActionRequired(action_required) = &message.content[0] else {
+            panic!("expected action-required content");
+        };
+        let ActionRequiredData::Elicitation { id, message, .. } = &action_required.data else {
+            panic!("expected elicitation action-required content");
+        };
+        assert!(id.starts_with(ACP_PROVIDER_ELICITATION_ID_PREFIX));
+        assert_eq!(message, "Choose an answer");
+
+        assert!(
+            provider
+                .handle_elicitation_response(
+                    id,
+                    &serde_json::json!({ "answer": "alpha" }),
+                    &McpElicitationAction::Accept,
+                )
+                .await
+        );
+
+        let response = response_rx.await.unwrap();
+        let AcpElicitationAction::Accept(accept) = response.action else {
+            panic!("expected accepted elicitation response");
+        };
+        assert_eq!(
+            accept.content.unwrap().get("answer"),
+            Some(&ElicitationContentValue::String("alpha".to_string()))
+        );
+
+        prompt_tx
+            .send(AcpUpdate::Complete(StopReason::EndTurn, None))
+            .await
+            .unwrap();
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_elicitation_content_keeps_the_live_request_pending() {
+        let (provider, _) = test_provider();
+        let (response_tx, response_rx) = oneshot::channel();
+        provider
+            .pending_elicitations
+            .lock()
+            .unwrap()
+            .insert("request-1".to_string(), response_tx);
+
+        assert!(
+            !provider
+                .handle_elicitation_response(
+                    "request-1",
+                    &serde_json::json!({ "answer": { "nested": true } }),
+                    &McpElicitationAction::Accept,
+                )
+                .await
+        );
+        assert!(provider.has_pending_elicitation("request-1").await);
+
+        assert!(
+            provider
+                .handle_elicitation_response(
+                    "request-1",
+                    &serde_json::json!({ "answer": "valid" }),
+                    &McpElicitationAction::Accept,
+                )
+                .await
+        );
+        let response = response_rx.await.unwrap();
+        let AcpElicitationAction::Accept(accept) = response.action else {
+            panic!("expected accepted response");
+        };
+        assert_eq!(
+            accept.content.unwrap().get("answer"),
+            Some(&ElicitationContentValue::String("valid".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_provider_stream_cancels_live_elicitation_waiters() {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (response_tx, response_rx) = oneshot::channel();
+        pending
+            .lock()
+            .unwrap()
+            .insert("request-1".to_string(), response_tx);
+
+        drop(PendingElicitationGuard {
+            pending: pending.clone(),
+        });
+
+        assert!(pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            response_rx.await.unwrap().action,
+            AcpElicitationAction::Cancel
+        ));
+    }
+
+    #[tokio::test]
+    async fn nested_acp_form_elicitation_round_trips_over_the_protocol() {
+        use futures::StreamExt;
+
+        let (provider_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, provider_write) = tokio::io::duplex(64 * 1024);
+        let provider_transport = agent_client_protocol::ByteStreams::new(
+            provider_write.compat_write(),
+            provider_read.compat(),
+        );
+        let agent_transport = agent_client_protocol::ByteStreams::new(
+            agent_write.compat_write(),
+            agent_read.compat(),
+        );
+        let (observed_response_tx, mut observed_response_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let nested_agent = tokio::spawn(async move {
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |request: InitializeRequest, responder, _cx| {
+                        assert!(
+                            request
+                                .client_capabilities
+                                .elicitation
+                                .as_ref()
+                                .and_then(|elicitation| elicitation.form.as_ref())
+                                .is_some(),
+                            "the nested provider must see form elicitation support"
+                        );
+                        responder.respond(
+                            InitializeResponse::new(request.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new("nested-session"))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: PromptRequest, responder, cx| {
+                        let cx_for_prompt = cx.clone();
+                        let observed_response_tx = observed_response_tx.clone();
+                        cx.spawn(async move {
+                            let schema = ElicitationSchema::new()
+                                .property(
+                                    "priorities",
+                                    MultiSelectPropertySchema::new(vec![
+                                        "quality".to_string(),
+                                        "speed".to_string(),
+                                        "playfulness".to_string(),
+                                    ]),
+                                    true,
+                                )
+                                .string("context", true);
+                            let response = cx_for_prompt
+                                .send_request(CreateElicitationRequest::new(
+                                    ElicitationFormMode::new(
+                                        ElicitationSessionScope::new("nested-session"),
+                                        schema,
+                                    ),
+                                    "Choose priorities and add context",
+                                ))
+                                .block_task()
+                                .await?;
+                            observed_response_tx
+                                .send(response)
+                                .map_err(|_| agent_client_protocol::Error::internal_error())?;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(agent_transport, async move |_cx: ConnectionTo<Client>| {
+                    let _ = shutdown_rx.await;
+                    Ok(())
+                })
+                .await
+        });
+
+        let provider = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            AcpProvider::connect_with_transport(
+                "nested-acp-test".to_string(),
+                GooseMode::Auto,
+                test_acp_config(HashMap::new(), None),
+                provider_transport,
+            ),
+        )
+        .await
+        .expect("timed out connecting the nested ACP provider")
+        .unwrap();
+        let model = ModelConfig::new("test-model");
+        let messages = vec![Message::user().with_text("Interview me")];
+        let mut stream = provider.stream(&model, "", &messages, &[]).await.unwrap();
+
+        let (message, usage) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("timed out waiting for the nested form request")
+                .unwrap()
+                .unwrap();
+        assert!(usage.is_none());
+        let message = message.expect("expected forwarded form request");
+        let MessageContent::ActionRequired(action_required) = &message.content[0] else {
+            panic!("expected action-required content");
+        };
+        let ActionRequiredData::Elicitation {
+            id,
+            message,
+            requested_schema,
+        } = &action_required.data
+        else {
+            panic!("expected elicitation content");
+        };
+        assert_eq!(message, "Choose priorities and add context");
+        assert_eq!(
+            requested_schema["properties"]["priorities"]["type"],
+            "array"
+        );
+
+        assert!(
+            provider
+                .handle_elicitation_response(
+                    id,
+                    &serde_json::json!({
+                        "priorities": ["quality", "playfulness"],
+                        "context": "Keep the Berd twist"
+                    }),
+                    &McpElicitationAction::Accept,
+                )
+                .await
+        );
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            observed_response_rx.recv(),
+        )
+        .await
+        .expect("timed out waiting for the nested form response")
+        .expect("nested agent should receive the form response");
+        let AcpElicitationAction::Accept(accept) = response.action else {
+            panic!("expected accepted elicitation response");
+        };
+        let content = accept.content.expect("accepted response content");
+        assert_eq!(
+            content.get("priorities"),
+            Some(&ElicitationContentValue::StringArray(vec![
+                "quality".to_string(),
+                "playfulness".to_string(),
+            ]))
+        );
+        assert_eq!(
+            content.get("context"),
+            Some(&ElicitationContentValue::String(
+                "Keep the Berd twist".to_string()
+            ))
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("timed out waiting for the nested prompt to finish")
+                .is_none()
+        );
+
+        drop(stream);
+        drop(shutdown_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), nested_agent).await;
+        drop(provider);
+    }
+
+    #[tokio::test]
+    async fn cursor_questions_round_trip_through_standard_form_elicitation() {
+        use crate::acp::cursor::{
+            CursorAskQuestionOutcome, CursorQuestion, CursorQuestionAnswer, CursorQuestionOption,
+        };
+        use futures::StreamExt;
+
+        let (provider_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, provider_write) = tokio::io::duplex(64 * 1024);
+        let provider_transport = agent_client_protocol::ByteStreams::new(
+            provider_write.compat_write(),
+            provider_read.compat(),
+        );
+        let agent_transport = agent_client_protocol::ByteStreams::new(
+            agent_write.compat_write(),
+            agent_read.compat(),
+        );
+        let (observed_response_tx, mut observed_response_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let nested_agent = tokio::spawn(async move {
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |request: InitializeRequest, responder, _cx| {
+                        responder.respond(
+                            InitializeResponse::new(request.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new("cursor-session"))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: PromptRequest, responder, cx| {
+                        let cx_for_prompt = cx.clone();
+                        let observed_response_tx = observed_response_tx.clone();
+                        cx.spawn(async move {
+                            let response = cx_for_prompt
+                                .send_request(CursorAskQuestionRequest {
+                                    tool_call_id: "tool-1".to_string(),
+                                    title: Some("Shape the implementation".to_string()),
+                                    questions: vec![
+                                        CursorQuestion {
+                                            id: "direction".to_string(),
+                                            prompt: "Which direction?".to_string(),
+                                            options: vec![
+                                                CursorQuestionOption {
+                                                    id: "native".to_string(),
+                                                    label: "Native ACP".to_string(),
+                                                },
+                                                CursorQuestionOption {
+                                                    id: "prose".to_string(),
+                                                    label: "Prose".to_string(),
+                                                },
+                                            ],
+                                            allow_multiple: false,
+                                        },
+                                        CursorQuestion {
+                                            id: "priorities".to_string(),
+                                            prompt: "What matters?".to_string(),
+                                            options: vec![
+                                                CursorQuestionOption {
+                                                    id: "quality".to_string(),
+                                                    label: "Quality".to_string(),
+                                                },
+                                                CursorQuestionOption {
+                                                    id: "speed".to_string(),
+                                                    label: "Speed".to_string(),
+                                                },
+                                            ],
+                                            allow_multiple: true,
+                                        },
+                                    ],
+                                })
+                                .block_task()
+                                .await?;
+                            observed_response_tx
+                                .send(response)
+                                .map_err(|_| agent_client_protocol::Error::internal_error())?;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })?;
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(agent_transport, async move |_cx: ConnectionTo<Client>| {
+                    let _ = shutdown_rx.await;
+                    Ok(())
+                })
+                .await
+        });
+
+        let provider = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            AcpProvider::connect_with_transport_and_extensions(
+                "cursor-agent".to_string(),
+                GooseMode::Auto,
+                test_acp_config(HashMap::new(), None),
+                provider_transport,
+                vec![AcpClientExtension::CursorAskQuestion],
+            ),
+        )
+        .await
+        .expect("timed out connecting the Cursor ACP provider")
+        .unwrap();
+        let model = ModelConfig::new("auto");
+        let messages = vec![Message::user().with_text("Interview me")];
+        let mut stream = provider.stream(&model, "", &messages, &[]).await.unwrap();
+
+        let (message, usage) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("timed out waiting for the Cursor question")
+                .unwrap()
+                .unwrap();
+        assert!(usage.is_none());
+        let message = message.expect("expected forwarded Cursor question");
+        let MessageContent::ActionRequired(action_required) = &message.content[0] else {
+            panic!("expected action-required content");
+        };
+        let ActionRequiredData::Elicitation {
+            id,
+            message,
+            requested_schema,
+        } = &action_required.data
+        else {
+            panic!("expected elicitation content");
+        };
+        assert_eq!(message, "Shape the implementation");
+        assert_eq!(
+            requested_schema["properties"]["direction"]["oneOf"][0]["const"],
+            "native"
+        );
+        assert_eq!(
+            requested_schema["properties"]["priorities"]["items"]["anyOf"][1]["const"],
+            "speed"
+        );
+        assert!(
+            !requested_schema.to_string().contains("Other"),
+            "the adapter must not invent a free-form option"
+        );
+
+        assert!(
+            provider
+                .handle_elicitation_response(
+                    id,
+                    &serde_json::json!({
+                        "direction": "native",
+                        "priorities": ["quality", "speed"]
+                    }),
+                    &McpElicitationAction::Accept,
+                )
+                .await
+        );
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            observed_response_rx.recv(),
+        )
+        .await
+        .expect("timed out waiting for the Cursor response")
+        .expect("Cursor should receive the response");
+        assert_eq!(
+            response.outcome,
+            CursorAskQuestionOutcome::Answered {
+                answers: vec![
+                    CursorQuestionAnswer {
+                        question_id: "direction".to_string(),
+                        selected_option_ids: vec!["native".to_string()],
+                    },
+                    CursorQuestionAnswer {
+                        question_id: "priorities".to_string(),
+                        selected_option_ids: vec!["quality".to_string(), "speed".to_string()],
+                    },
+                ],
+            }
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("timed out waiting for the Cursor prompt to finish")
+                .is_none()
+        );
+        drop(stream);
+        drop(shutdown_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), nested_agent).await;
+        drop(provider);
+    }
+
     #[test]
     fn prompt_auth_error_maps_to_provider_authentication() {
         let error = provider_error_from_acp(agent_client_protocol::Error::auth_required());
@@ -2119,6 +2907,7 @@ mod tests {
                     response: NewSessionResponse::new("test-session"),
                 }),
                 pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
+                pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),
@@ -3002,6 +3791,7 @@ mod tests {
             "acp-test".to_string(),
             GooseMode::Auto,
             test_acp_config(HashMap::new(), None),
+            Vec::new(),
             Box::new(move |_, _, init_tx, cancel_rx| {
                 Box::pin(async move {
                     let _init_tx = init_tx;

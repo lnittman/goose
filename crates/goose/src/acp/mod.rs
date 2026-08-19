@@ -1,4 +1,5 @@
 mod common;
+mod cursor;
 pub(crate) mod fs;
 mod handoff;
 mod mcp_app_proxy;
@@ -13,8 +14,10 @@ pub mod transport;
 pub use common::{map_permission_response, PermissionDecision};
 pub use goose_sdk_types::{custom_notifications, custom_requests};
 pub use provider::{
-    extension_configs_to_mcp_servers, AcpProvider, AcpProviderConfig, ACP_CURRENT_MODEL,
+    extension_configs_to_mcp_servers, AcpClientExtension, AcpProvider, AcpProviderConfig,
+    ACP_CURRENT_MODEL,
 };
+pub(crate) use provider::{is_provider_form_elicitation, ACP_PROVIDER_ELICITATION_ID_PREFIX};
 
 /// `data.reason` on a prompt error raised because the agent's account is out of credits.
 /// Set by the ACP server, read by the provider to tell a spent account apart from a

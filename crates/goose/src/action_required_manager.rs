@@ -157,6 +157,19 @@ impl ActionRequiredManager {
             .ok_or_else(|| anyhow::anyhow!("Request not found: {}", request_id))
     }
 
+    pub(crate) async fn has_pending_response(&self, session_id: &str, request_id: &str) -> bool {
+        let pending = self.pending.read().await.get(request_id).cloned();
+        let Some(pending) = pending else {
+            return false;
+        };
+        let pending = pending.lock().await;
+        pending.session_id == session_id
+            && pending
+                .response_tx
+                .as_ref()
+                .is_some_and(|response_tx| !response_tx.is_closed())
+    }
+
     async fn wait_for_response(
         &self,
         request_id: &str,

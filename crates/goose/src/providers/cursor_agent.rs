@@ -1,20 +1,28 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use rmcp::model::Role;
+use rmcp::model::{ElicitationAction, Role};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use super::base::{
-    stream_from_single_message, ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata,
+    current_working_dir, stream_from_single_message, ConfigKey, MessageStream, PermissionRouting,
+    Provider, ProviderDef, ProviderMetadata,
 };
 use super::catalog::ProviderSetupMetadata;
 use super::utils::filter_extensions_from_system_prompt;
+use crate::acp::{
+    extension_configs_to_mcp_servers, AcpClientExtension, AcpProvider, AcpProviderConfig,
+};
 use crate::config::search_path::SearchPaths;
+use crate::config::{Config, ExtensionConfig, GooseMode};
 use crate::conversation::message::{Message, MessageContent};
+use crate::permission::PermissionConfirmation;
 use crate::subprocess::configure_subprocess;
 use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
@@ -34,29 +42,132 @@ pub const CURSOR_AGENT_KNOWN_MODELS: &[&str] = &[
     "composer-2.5-fast",
 ];
 
-pub const CURSOR_AGENT_DOC_URL: &str = "https://docs.cursor.com/en/cli/overview";
+pub const CURSOR_AGENT_DOC_URL: &str = "https://cursor.com/docs/cli/acp";
 
 const CURSOR_AGENT_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const STRUCTURED_ELICITATION_FALLBACK: &str = "This client is running Cursor without ACP interactive forms. If instructions ask you to use ask_user, request_user_input, or an equivalent interactive-question tool, ask the same question directly in plain prose with every choice, then stop and wait for the user's reply. Ask once and do not report a missing client tool.";
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
 pub struct CursorAgentProvider {
     command: PathBuf,
-    #[serde(skip)]
     name: String,
+    transport: Mutex<CursorTransport>,
+}
+
+#[derive(Debug)]
+enum CursorTransport {
+    Unprepared(Option<Arc<AcpProvider>>),
+    Acp(Arc<AcpProvider>),
+    Direct,
+    Unavailable(String),
 }
 
 impl CursorAgentProvider {
     pub async fn from_env(
+        extensions: Vec<ExtensionConfig>,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+    ) -> Result<Self> {
+        Self::build(extensions, current_working_dir(), tls_config).await
+    }
+
+    async fn build(
+        extensions: Vec<ExtensionConfig>,
+        working_dir: PathBuf,
         _tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> Result<Self> {
-        let config = crate::config::Config::global();
+        let config = Config::global();
         let command: String = config.get_cursor_agent_command().unwrap_or_default().into();
         let resolved_command = SearchPaths::builder().with_npm().resolve(&command)?;
+        let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+        Ok(Self::build_with_command(resolved_command, extensions, working_dir, goose_mode).await)
+    }
 
-        Ok(Self {
+    async fn build_with_command(
+        resolved_command: PathBuf,
+        extensions: Vec<ExtensionConfig>,
+        working_dir: PathBuf,
+        goose_mode: GooseMode,
+    ) -> Self {
+        let mode_mapping = HashMap::from([
+            (GooseMode::Auto, vec!["agent".to_string()]),
+            (GooseMode::SmartApprove, vec!["agent".to_string()]),
+            (GooseMode::Approve, vec!["agent".to_string()]),
+            (GooseMode::Chat, vec!["ask".to_string(), "plan".to_string()]),
+        ]);
+        let provider_config = AcpProviderConfig {
+            command: resolved_command.clone(),
+            args: vec!["acp".to_string()],
+            env: vec![],
+            env_remove: vec![],
+            work_dir: working_dir,
+            mcp_servers: extension_configs_to_mcp_servers(&extensions),
+            session_mode_id: mode_mapping[&goose_mode].first().cloned(),
+            session_config_options: vec![],
+            model_config_option_id: Some("model".to_string()),
+            mode_mapping,
+            notification_callback: None,
+        };
+
+        let acp = match AcpProvider::connect_with_client_extensions(
+            CURSOR_AGENT_PROVIDER_NAME.to_string(),
+            goose_mode,
+            provider_config,
+            vec![AcpClientExtension::CursorAskQuestion],
+        )
+        .await
+        {
+            Ok(provider) => Some(Arc::new(provider)),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Cursor ACP unavailable; using the direct CLI transport"
+                );
+                None
+            }
+        };
+
+        Self {
             command: resolved_command,
             name: CURSOR_AGENT_PROVIDER_NAME.to_string(),
-        })
+            transport: Mutex::new(CursorTransport::Unprepared(acp)),
+        }
+    }
+
+    fn acp_candidate(&self) -> Option<Arc<AcpProvider>> {
+        let transport = self.transport.lock().ok()?;
+        match &*transport {
+            CursorTransport::Unprepared(provider) => provider.clone(),
+            CursorTransport::Acp(provider) => Some(provider.clone()),
+            CursorTransport::Direct | CursorTransport::Unavailable(_) => None,
+        }
+    }
+
+    fn selected_acp(&self) -> Option<Arc<AcpProvider>> {
+        let transport = self.transport.lock().ok()?;
+        match &*transport {
+            CursorTransport::Acp(provider) => Some(provider.clone()),
+            _ => None,
+        }
+    }
+
+    fn selected_transport(&self) -> Result<Option<Arc<AcpProvider>>, ProviderError> {
+        let mut transport = self.transport.lock().map_err(|_| {
+            ProviderError::RequestFailed("Cursor transport lock poisoned".to_string())
+        })?;
+
+        if let CursorTransport::Unprepared(provider) = &mut *transport {
+            *transport = match provider.take() {
+                Some(provider) => CursorTransport::Acp(provider),
+                None => CursorTransport::Direct,
+            };
+        }
+
+        match &*transport {
+            CursorTransport::Acp(provider) => Ok(Some(provider.clone())),
+            CursorTransport::Direct => Ok(None),
+            CursorTransport::Unavailable(error) => Err(ProviderError::RequestFailed(error.clone())),
+            CursorTransport::Unprepared(_) => unreachable!("Cursor transport was selected"),
+        }
     }
 
     /// Get authentication status from cursor-agent
@@ -139,6 +250,8 @@ impl CursorAgentProvider {
 
         let filtered_system = filter_extensions_from_system_prompt(system);
         full_prompt.push_str(&filtered_system);
+        full_prompt.push_str("\n\n");
+        full_prompt.push_str(STRUCTURED_ELICITATION_FALLBACK);
         full_prompt.push_str("\n\n");
 
         // Add conversation history
@@ -481,7 +594,8 @@ impl goose_providers::base::ProviderDescriptor for CursorAgentProvider {
                 "cursor-agent",
                 &["cursor-agent", "cursor_agent", "cursor"],
             )
-            .with_docs_url("https://docs.cursor.com/en/cli/overview")
+            .with_acp()
+            .with_docs_url(CURSOR_AGENT_DOC_URL)
             .with_capabilities(true, true, true),
         )
     }
@@ -491,10 +605,18 @@ impl ProviderDef for CursorAgentProvider {
     type Provider = Self;
 
     fn from_env(
-        _extensions: Vec<crate::config::ExtensionConfig>,
+        extensions: Vec<ExtensionConfig>,
         tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> BoxFuture<'static, Result<Self::Provider>> {
-        Box::pin(Self::from_env(tls_config))
+        Box::pin(Self::from_env(extensions, tls_config))
+    }
+
+    fn from_env_with_working_dir(
+        extensions: Vec<ExtensionConfig>,
+        working_dir: PathBuf,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+    ) -> BoxFuture<'static, Result<Self::Provider>> {
+        Box::pin(Self::build(extensions, working_dir, tls_config))
     }
 }
 
@@ -504,6 +626,129 @@ impl Provider for CursorAgentProvider {
         &self.name
     }
 
+    fn provider_session_id(&self) -> Option<String> {
+        self.selected_acp()
+            .and_then(|provider| provider.provider_session_id())
+    }
+
+    async fn resume(&self, session_id: &str) -> Result<(), ProviderError> {
+        match self.acp_candidate() {
+            Some(provider) => provider.resume(session_id).await,
+            None => Err(ProviderError::RequestFailed(
+                "Cursor ACP is unavailable for this saved session".to_string(),
+            )),
+        }
+    }
+
+    async fn prepare_session(
+        &self,
+        provider_session_id: Option<&str>,
+        has_provider_history: bool,
+    ) -> Result<(), ProviderError> {
+        if has_provider_history && provider_session_id.is_none() {
+            let mut transport = self.transport.lock().map_err(|_| {
+                ProviderError::RequestFailed("Cursor transport lock poisoned".to_string())
+            })?;
+            *transport = CursorTransport::Direct;
+            return Ok(());
+        }
+
+        let Some(session_id) = provider_session_id else {
+            self.selected_transport()?;
+            return Ok(());
+        };
+
+        let Some(provider) = self.acp_candidate() else {
+            let error =
+                "Saved Cursor session requires ACP, but Cursor ACP is unavailable".to_string();
+            if let Ok(mut transport) = self.transport.lock() {
+                *transport = CursorTransport::Unavailable(error.clone());
+            }
+            return Err(ProviderError::RequestFailed(error));
+        };
+
+        match provider.resume(session_id).await {
+            Ok(()) => {
+                let mut transport = self.transport.lock().map_err(|_| {
+                    ProviderError::RequestFailed("Cursor transport lock poisoned".to_string())
+                })?;
+                *transport = CursorTransport::Acp(provider);
+                Ok(())
+            }
+            Err(error) => {
+                let message = format!("Could not resume the saved Cursor ACP session: {error}");
+                if let Ok(mut transport) = self.transport.lock() {
+                    *transport = CursorTransport::Unavailable(message.clone());
+                }
+                Err(ProviderError::RequestFailed(message))
+            }
+        }
+    }
+
+    async fn get_context_limit(&self, model_config: &ModelConfig) -> Result<usize, ProviderError> {
+        match self.selected_acp() {
+            Some(provider) => provider.get_context_limit(model_config).await,
+            None => Ok(model_config.context_limit()),
+        }
+    }
+
+    async fn update_mode(&self, session_id: &str, mode: GooseMode) -> Result<(), ProviderError> {
+        match self.selected_acp() {
+            Some(provider) => provider.update_mode(session_id, mode).await,
+            None => Ok(()),
+        }
+    }
+
+    fn permission_routing(&self) -> PermissionRouting {
+        self.selected_acp()
+            .map_or(PermissionRouting::Noop, |provider| {
+                provider.permission_routing()
+            })
+    }
+
+    fn manages_own_context(&self) -> bool {
+        self.selected_acp()
+            .is_some_and(|provider| provider.manages_own_context())
+    }
+
+    async fn handle_permission_confirmation(
+        &self,
+        request_id: &str,
+        confirmation: &PermissionConfirmation,
+    ) -> bool {
+        match self.selected_acp() {
+            Some(provider) => {
+                provider
+                    .handle_permission_confirmation(request_id, confirmation)
+                    .await
+            }
+            None => false,
+        }
+    }
+
+    async fn handle_elicitation_response(
+        &self,
+        request_id: &str,
+        user_data: &Value,
+        action: &ElicitationAction,
+    ) -> bool {
+        match self.selected_acp() {
+            Some(provider) => {
+                provider
+                    .handle_elicitation_response(request_id, user_data, action)
+                    .await
+            }
+            None => false,
+        }
+    }
+
+    async fn has_pending_elicitation(&self, request_id: &str) -> bool {
+        match self.selected_acp() {
+            Some(provider) => provider.has_pending_elicitation(request_id).await,
+            None => false,
+        }
+    }
+
     fn skip_canonical_filtering(&self) -> bool {
         // Cursor model IDs are CLI/account-specific and often absent from the
         // canonical registry. Keep the live list intact for inventory/config.
@@ -511,6 +756,14 @@ impl Provider for CursorAgentProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
+        if let Some(provider) = self.acp_candidate() {
+            if let Ok(models) = provider.fetch_supported_models().await {
+                if !models.is_empty() {
+                    return Ok(models);
+                }
+            }
+        }
+
         match self.list_models_from_cli().await {
             Ok(models) if !models.is_empty() => Ok(models),
             Ok(_) => {
@@ -536,6 +789,10 @@ impl Provider for CursorAgentProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        if let Some(provider) = self.selected_transport()? {
+            return provider.stream(model_config, system, messages, tools).await;
+        }
+
         if super::cli_common::is_session_description_request(system) {
             let (message, provider_usage) = super::cli_common::generate_simple_session_description(
                 &model_config.model_name,
@@ -586,6 +843,9 @@ mod tests {
             &command,
             r#"#!/bin/sh
 record_dir=${0%/*}
+if [ "$1" = "acp" ]; then
+  exit 64
+fi
 printf '%s\n' "$@" > "$record_dir/args"
 cat > "$record_dir/stdin"
 printf '%s\n' '{"type":"result","result":"ok"}'
@@ -601,6 +861,7 @@ printf '%s\n' '{"type":"result","result":"ok"}'
         let provider = CursorAgentProvider {
             command: recording_cli(directory.path()),
             name: CURSOR_AGENT_PROVIDER_NAME.to_string(),
+            transport: Mutex::new(CursorTransport::Direct),
         };
 
         let lines = provider
@@ -618,6 +879,9 @@ printf '%s\n' '{"type":"result","result":"ok"}'
         let stdin = fs::read_to_string(directory.path().join("stdin")).unwrap();
         assert!(!args.contains(SENTINEL));
         assert!(stdin.contains(SENTINEL));
+        assert!(stdin.contains("ask the same question directly in plain prose"));
+        assert!(stdin.contains("Ask once"));
+        assert!(stdin.contains("do not report a missing client tool"));
         assert!(!args.lines().any(|arg| arg == "-p"));
         assert!(args.contains("--model\nauto"));
         assert!(args.lines().any(|arg| arg == "--print"));
@@ -638,6 +902,92 @@ printf '%s\n' '{"type":"result","result":"ok"}'
             Message::user().with_text(SENTINEL),
         ])
         .await;
+    }
+
+    #[tokio::test]
+    async fn acp_startup_failure_selects_direct_transport_for_the_provider_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = CursorAgentProvider::build_with_command(
+            recording_cli(directory.path()),
+            vec![],
+            directory.path().to_path_buf(),
+            GooseMode::Auto,
+        )
+        .await;
+
+        assert!(matches!(
+            &*provider.transport.lock().unwrap(),
+            CursorTransport::Unprepared(None)
+        ));
+        provider.prepare_session(None, false).await.unwrap();
+        assert!(matches!(
+            &*provider.transport.lock().unwrap(),
+            CursorTransport::Direct
+        ));
+        assert!(provider.provider_session_id().is_none());
+
+        let (message, _) = provider
+            .complete(
+                &ModelConfig::new(CURSOR_AGENT_DEFAULT_MODEL),
+                "system instructions",
+                &[Message::user().with_text(SENTINEL)],
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(message.as_concat_text(), "ok");
+    }
+
+    #[tokio::test]
+    async fn historical_direct_session_remains_on_the_direct_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = CursorAgentProvider {
+            command: recording_cli(directory.path()),
+            name: CURSOR_AGENT_PROVIDER_NAME.to_string(),
+            transport: Mutex::new(CursorTransport::Unprepared(None)),
+        };
+
+        provider.prepare_session(None, true).await.unwrap();
+
+        assert!(matches!(
+            &*provider.transport.lock().unwrap(),
+            CursorTransport::Direct
+        ));
+        assert!(provider.provider_session_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn saved_acp_session_never_falls_back_to_direct_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = CursorAgentProvider {
+            command: recording_cli(directory.path()),
+            name: CURSOR_AGENT_PROVIDER_NAME.to_string(),
+            transport: Mutex::new(CursorTransport::Unprepared(None)),
+        };
+
+        let error = provider
+            .prepare_session(Some("saved-cursor-session"), true)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("requires ACP"));
+        assert!(matches!(
+            &*provider.transport.lock().unwrap(),
+            CursorTransport::Unavailable(_)
+        ));
+        let stream_error = match provider
+            .stream(
+                &ModelConfig::new(CURSOR_AGENT_DEFAULT_MODEL),
+                "system instructions",
+                &[Message::user().with_text(SENTINEL)],
+                &[],
+            )
+            .await
+        {
+            Ok(_) => panic!("saved ACP session must not fall back to direct transport"),
+            Err(error) => error,
+        };
+        assert!(stream_error.to_string().contains("requires ACP"));
     }
 
     #[test]

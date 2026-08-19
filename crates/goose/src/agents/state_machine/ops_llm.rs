@@ -439,17 +439,24 @@ impl Inference<Session, GooseEffect> for InferenceRunner<'_> {
                 .await
                 .unwrap_or_else(|_| self.model_config.context_limit());
             let provider_name = self.provider.get_name();
-            if let Some(session_id) = super::super::latest_provider_session_id(
+            let saved_provider_inference = super::super::latest_provider_inference(
                 conversation.messages(),
                 provider_name,
-            ) {
-                if let Err(error) = self.provider.resume(session_id).await {
-                    tracing::warn!(
-                        provider = provider_name,
-                        %error,
-                        "Could not resume provider session; continuing with a handoff"
-                    );
-                }
+            );
+            if let Err(error) = self
+                .provider
+                .prepare_session(
+                    saved_provider_inference
+                        .and_then(|inference| inference.provider_session_id.as_deref()),
+                    saved_provider_inference.is_some(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    provider = provider_name,
+                    %error,
+                    "Could not prepare provider session; continuing with a handoff"
+                );
             }
             let turn = messages_since_kickoff(conversation)?;
             let turn_start = turn
@@ -514,6 +521,7 @@ impl Inference<Session, GooseEffect> for InferenceRunner<'_> {
 
             let mut accumulator = Conversation::empty();
             let mut tool_request_ids = std::collections::HashSet::new();
+            let mut saw_live_provider_elicitation = false;
             loop {
                 tokio::select! {
                     biased;
@@ -552,15 +560,25 @@ impl Inference<Session, GooseEffect> for InferenceRunner<'_> {
                                 continue;
                             }
                             let chunk = emit.message(chunk).await;
-                            accumulator.push(chunk);
+                            if crate::acp::is_provider_form_elicitation(&chunk) {
+                                // `Agent::reply_with_state_machine` persists this before
+                                // exposing it to ACP. The nested provider stream remains
+                                // open while the user answers, so deferring persistence
+                                // as a normal inference effect would put the response
+                                // before the request (or duplicate the request).
+                                saw_live_provider_elicitation = true;
+                            } else {
+                                accumulator.push(chunk);
+                            }
                         }
                     }
                 }
             }
 
-            let empty_response = !accumulator
-                .iter()
-                .any(|message| message.metadata.output_token_limit_reached)
+            let empty_response = !saw_live_provider_elicitation
+                && !accumulator
+                    .iter()
+                    .any(|message| message.metadata.output_token_limit_reached)
                 && accumulator.iter().all(|message| {
                     message.content.iter().all(|content| match content {
                         MessageContent::Text(text) => text.text.trim().is_empty(),

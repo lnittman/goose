@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::Stream;
-use rmcp::model::Tool;
+use rmcp::model::{ElicitationAction, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -462,6 +462,17 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
 
+    async fn prepare_session(
+        &self,
+        provider_session_id: Option<&str>,
+        _has_provider_history: bool,
+    ) -> Result<(), ProviderError> {
+        match provider_session_id {
+            Some(session_id) => self.resume(session_id).await,
+            None => Ok(()),
+        }
+    }
+
     /// Primary streaming method that all providers must implement.
     async fn stream(
         &self,
@@ -655,6 +666,19 @@ pub trait Provider: Send + Sync {
         _request_id: &str,
         _confirmation: &PermissionConfirmation,
     ) -> bool {
+        false
+    }
+
+    async fn handle_elicitation_response(
+        &self,
+        _request_id: &str,
+        _user_data: &Value,
+        _action: &ElicitationAction,
+    ) -> bool {
+        false
+    }
+
+    async fn has_pending_elicitation(&self, _request_id: &str) -> bool {
         false
     }
 }
