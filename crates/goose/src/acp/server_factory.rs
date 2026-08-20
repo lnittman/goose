@@ -70,22 +70,34 @@ impl AcpServer {
         }
 
         let provider_factory: AcpProviderFactory = Arc::new(
-            move |provider_name, extensions, working_dir, use_default_model| {
+            move |provider_name, extensions, working_dir, use_default_model, host_capabilities| {
                 Box::pin(async move {
                     if use_default_model {
-                        crate::providers::create_with_default_model(&provider_name, extensions)
-                            .await
+                        crate::providers::create_with_default_model_and_host_capabilities(
+                            &provider_name,
+                            extensions,
+                            host_capabilities,
+                        )
+                        .await
                     } else {
                         match working_dir {
                             Some(working_dir) => {
-                                crate::providers::create_with_working_dir(
+                                crate::providers::create_with_working_dir_and_host_capabilities(
                                     &provider_name,
                                     extensions,
                                     working_dir,
+                                    host_capabilities,
                                 )
                                 .await
                             }
-                            None => crate::providers::create(&provider_name, extensions).await,
+                            None => {
+                                crate::providers::create_with_host_capabilities(
+                                    &provider_name,
+                                    extensions,
+                                    host_capabilities,
+                                )
+                                .await
+                            }
                         }
                     }
                 })

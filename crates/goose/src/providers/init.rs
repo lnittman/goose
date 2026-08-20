@@ -266,6 +266,17 @@ pub async fn create(name: &str, extensions: Vec<ExtensionConfig>) -> Result<Arc<
     entry.create(extensions).await
 }
 
+pub async fn create_with_host_capabilities(
+    name: &str,
+    extensions: Vec<ExtensionConfig>,
+    host_capabilities: super::base::ProviderHostCapabilities,
+) -> Result<Arc<dyn Provider>> {
+    let entry = get_from_registry(name).await?;
+    entry
+        .create_with_host_capabilities(extensions, host_capabilities)
+        .await
+}
+
 pub async fn create_with_working_dir(
     name: &str,
     extensions: Vec<ExtensionConfig>,
@@ -275,6 +286,18 @@ pub async fn create_with_working_dir(
     entry.create_with_working_dir(extensions, working_dir).await
 }
 
+pub async fn create_with_working_dir_and_host_capabilities(
+    name: &str,
+    extensions: Vec<ExtensionConfig>,
+    working_dir: PathBuf,
+    host_capabilities: super::base::ProviderHostCapabilities,
+) -> Result<Arc<dyn Provider>> {
+    let entry = get_from_registry(name).await?;
+    entry
+        .create_with_working_dir_and_host_capabilities(extensions, working_dir, host_capabilities)
+        .await
+}
+
 pub async fn create_with_default_model(
     name: impl AsRef<str>,
     extensions: Vec<ExtensionConfig>,
@@ -282,6 +305,17 @@ pub async fn create_with_default_model(
     get_from_registry(name.as_ref())
         .await?
         .create_with_default_model(extensions)
+        .await
+}
+
+pub async fn create_with_default_model_and_host_capabilities(
+    name: impl AsRef<str>,
+    extensions: Vec<ExtensionConfig>,
+    host_capabilities: super::base::ProviderHostCapabilities,
+) -> Result<Arc<dyn Provider>> {
+    get_from_registry(name.as_ref())
+        .await?
+        .create_with_default_model_and_host_capabilities(extensions, host_capabilities)
         .await
 }
 

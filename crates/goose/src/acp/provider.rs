@@ -91,6 +91,9 @@ pub struct AcpProviderConfig {
     pub model_config_option_id: Option<String>,
     pub mode_mapping: HashMap<GooseMode, Vec<String>>,
     pub notification_callback: Option<Arc<dyn Fn(SessionNotification) + Send + Sync>>,
+    /// Advertise forms only when the outer host explicitly negotiated support;
+    /// entry points without a known host capability leave this false.
+    pub supports_form_elicitation: bool,
 }
 
 enum ClientRequest {
@@ -1658,8 +1661,12 @@ async fn handle_requests(
 ) -> Result<(), agent_client_protocol::Error> {
     let mut init_tx = Some(init_tx);
 
-    let client_capabilities = ClientCapabilities::new()
-        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+    let client_capabilities = if config.supports_form_elicitation {
+        ClientCapabilities::new()
+            .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+    } else {
+        ClientCapabilities::new()
+    };
     let init_response: InitializeResponse = cx
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1).client_capabilities(client_capabilities),
@@ -2795,6 +2802,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_acp_omits_forms_when_the_outer_host_did_not_advertise_them() {
+        let (provider_read, agent_write) = tokio::io::duplex(64 * 1024);
+        let (agent_read, provider_write) = tokio::io::duplex(64 * 1024);
+        let provider_transport = agent_client_protocol::ByteStreams::new(
+            provider_write.compat_write(),
+            provider_read.compat(),
+        );
+        let agent_transport = agent_client_protocol::ByteStreams::new(
+            agent_write.compat_write(),
+            agent_read.compat(),
+        );
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let nested_agent = tokio::spawn(async move {
+            Agent
+                .builder()
+                .on_receive_request(
+                    async move |request: InitializeRequest, responder, _cx| {
+                        let supports_forms = request
+                            .client_capabilities
+                            .elicitation
+                            .as_ref()
+                            .and_then(|elicitation| elicitation.form.as_ref())
+                            .is_some();
+                        let _ = observed_tx.send(supports_forms);
+                        responder.respond(
+                            InitializeResponse::new(request.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |_request: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new("nested-session"))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_with(agent_transport, async move |_cx: ConnectionTo<Client>| {
+                    let _ = shutdown_rx.await;
+                    Ok(())
+                })
+                .await
+        });
+
+        let mut config = test_acp_config(HashMap::new(), None);
+        config.supports_form_elicitation = false;
+        let provider = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            AcpProvider::connect_with_transport(
+                "nested-acp-test".to_string(),
+                GooseMode::Auto,
+                config,
+                provider_transport,
+            ),
+        )
+        .await
+        .expect("timed out connecting the nested ACP provider")
+        .unwrap();
+
+        assert!(!observed_rx.recv().await.unwrap());
+        drop(shutdown_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), nested_agent).await;
+        drop(provider);
+    }
+
+    #[tokio::test]
     async fn cursor_questions_round_trip_through_standard_form_elicitation() {
         use crate::acp::cursor::{
             CursorAskQuestionOutcome, CursorQuestion, CursorQuestionAnswer, CursorQuestionOption,
@@ -3895,6 +3970,7 @@ mod tests {
             model_config_option_id: None,
             mode_mapping,
             notification_callback: None,
+            supports_form_elicitation: true,
         }
     }
 

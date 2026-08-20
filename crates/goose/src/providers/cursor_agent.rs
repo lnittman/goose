@@ -12,7 +12,7 @@ use tokio::process::Command;
 
 use super::base::{
     current_working_dir, stream_from_single_message, ConfigKey, MessageStream, PermissionRouting,
-    Provider, ProviderDef, ProviderMetadata,
+    Provider, ProviderDef, ProviderHostCapabilities, ProviderMetadata,
 };
 use super::catalog::ProviderSetupMetadata;
 use super::utils::filter_extensions_from_system_prompt;
@@ -67,19 +67,33 @@ impl CursorAgentProvider {
         extensions: Vec<ExtensionConfig>,
         tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> Result<Self> {
-        Self::build(extensions, current_working_dir(), tls_config).await
+        Self::build(
+            extensions,
+            current_working_dir(),
+            tls_config,
+            ProviderHostCapabilities::default(),
+        )
+        .await
     }
 
     async fn build(
         extensions: Vec<ExtensionConfig>,
         working_dir: PathBuf,
         _tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
     ) -> Result<Self> {
         let config = Config::global();
         let command: String = config.get_cursor_agent_command().unwrap_or_default().into();
         let resolved_command = SearchPaths::builder().with_npm().resolve(&command)?;
         let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
-        Ok(Self::build_with_command(resolved_command, extensions, working_dir, goose_mode).await)
+        Ok(Self::build_with_command(
+            resolved_command,
+            extensions,
+            working_dir,
+            goose_mode,
+            host_capabilities,
+        )
+        .await)
     }
 
     async fn build_with_command(
@@ -87,6 +101,7 @@ impl CursorAgentProvider {
         extensions: Vec<ExtensionConfig>,
         working_dir: PathBuf,
         goose_mode: GooseMode,
+        host_capabilities: ProviderHostCapabilities,
     ) -> Self {
         let mode_mapping = HashMap::from([
             (GooseMode::Auto, vec!["agent".to_string()]),
@@ -106,6 +121,7 @@ impl CursorAgentProvider {
             model_config_option_id: Some("model".to_string()),
             mode_mapping,
             notification_callback: None,
+            supports_form_elicitation: host_capabilities.supports_form_elicitation,
         };
 
         let acp = match AcpProvider::connect_with_client_extensions(
@@ -611,12 +627,52 @@ impl ProviderDef for CursorAgentProvider {
         Box::pin(Self::from_env(extensions, tls_config))
     }
 
+    fn from_env_with_host_capabilities(
+        extensions: Vec<ExtensionConfig>,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<Self::Provider>> {
+        Box::pin(Self::build(
+            extensions,
+            current_working_dir(),
+            tls_config,
+            host_capabilities,
+        ))
+    }
+
     fn from_env_with_working_dir(
         extensions: Vec<ExtensionConfig>,
         working_dir: PathBuf,
         tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> BoxFuture<'static, Result<Self::Provider>> {
-        Box::pin(Self::build(extensions, working_dir, tls_config))
+        Box::pin(Self::build(
+            extensions,
+            working_dir,
+            tls_config,
+            ProviderHostCapabilities::default(),
+        ))
+    }
+
+    fn from_env_with_working_dir_and_host_capabilities(
+        extensions: Vec<ExtensionConfig>,
+        working_dir: PathBuf,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<Self::Provider>> {
+        Box::pin(Self::build(
+            extensions,
+            working_dir,
+            tls_config,
+            host_capabilities,
+        ))
+    }
+
+    fn from_env_with_default_model_and_host_capabilities(
+        extensions: Vec<ExtensionConfig>,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<Self::Provider>> {
+        Self::from_env_with_host_capabilities(extensions, tls_config, host_capabilities)
     }
 }
 
@@ -925,6 +981,7 @@ printf '%s\n' '{"type":"result","result":"ok"}'
             vec![],
             directory.path().to_path_buf(),
             GooseMode::Auto,
+            ProviderHostCapabilities::default(),
         )
         .await;
 
