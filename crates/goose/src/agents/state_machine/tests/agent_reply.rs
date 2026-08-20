@@ -18,7 +18,9 @@ use crate::action_required_manager::ElicitationOutcome;
 use crate::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
 use crate::config::permission::PermissionManager;
 use crate::config::GooseMode;
-use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
+use crate::conversation::message::{
+    ActionRequiredData, InferenceMetadata, Message, MessageContent,
+};
 use crate::providers::base::{MessageStream, PermissionRouting, Provider};
 use crate::session::{SessionManager, SessionType};
 use goose_providers::errors::ProviderError;
@@ -216,6 +218,57 @@ impl Provider for ActivationSensitiveProvider {
     }
 }
 
+struct PrepareFailureProvider {
+    prepare_calls: AtomicUsize,
+    stream_calls: AtomicUsize,
+    saw_saved_session: AtomicBool,
+}
+
+impl PrepareFailureProvider {
+    fn new() -> Self {
+        Self {
+            prepare_calls: AtomicUsize::new(0),
+            stream_calls: AtomicUsize::new(0),
+            saw_saved_session: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for PrepareFailureProvider {
+    fn get_name(&self) -> &str {
+        "cursor-resume-failure-test"
+    }
+
+    async fn prepare_session(
+        &self,
+        provider_session_id: Option<&str>,
+        has_provider_history: bool,
+    ) -> Result<(), ProviderError> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        self.saw_saved_session.store(
+            provider_session_id == Some("saved-cursor-session") && has_provider_history,
+            Ordering::SeqCst,
+        );
+        Err(ProviderError::RequestFailed(
+            "Cursor ACP resume failed".to_string(),
+        ))
+    }
+
+    async fn stream(
+        &self,
+        _model_config: &ModelConfig,
+        _system: &str,
+        _messages: &[Message],
+        _tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        Err(ProviderError::RequestFailed(
+            "stream must not follow a failed resume".to_string(),
+        ))
+    }
+}
+
 async fn agent_with_dummy_api() -> Result<(Agent, Arc<DummyApi>, String, tempfile::TempDir)> {
     let api = Arc::new(DummyApi::start(ProviderFeatures::default()).await);
     let api_client = goose_providers::api_client::ApiClient::new_with_tls(
@@ -319,6 +372,55 @@ async fn agent_with_activation_sensitive_provider() -> Result<(
         )
         .await?;
     provider.arm();
+
+    Ok((agent, provider, session.id, temp_dir))
+}
+
+async fn agent_with_prepare_failure_provider() -> Result<(
+    Agent,
+    Arc<PrepareFailureProvider>,
+    String,
+    tempfile::TempDir,
+)> {
+    let provider = Arc::new(PrepareFailureProvider::new());
+    let temp_dir = tempfile::tempdir()?;
+    let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+    let session = session_manager
+        .create_session(
+            temp_dir.path().to_path_buf(),
+            "cursor-resume-failure".to_string(),
+            SessionType::Hidden,
+            GooseMode::Auto,
+        )
+        .await?;
+    session_manager
+        .add_message(
+            &session.id,
+            &Message::assistant()
+                .with_text("prior Cursor response")
+                .with_inference(InferenceMetadata {
+                    provider: "cursor-resume-failure-test".to_string(),
+                    requested_model: "cursor-resume-failure-test".to_string(),
+                    resolved_model: None,
+                    provider_session_id: Some("saved-cursor-session".to_string()),
+                }),
+        )
+        .await?;
+    let agent = Agent::with_config(AgentConfig::new(
+        session_manager,
+        PermissionManager::instance(),
+        None,
+        GooseMode::Auto,
+        true,
+        GoosePlatform::GooseCli,
+    ));
+    agent
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("cursor-resume-failure-test"),
+            &session.id,
+        )
+        .await?;
 
     Ok((agent, provider, session.id, temp_dir))
 }
@@ -572,6 +674,47 @@ async fn cursor_transport_precedes_capability_queries_in_state_machine() -> Resu
 async fn cursor_transport_precedes_capability_queries_in_legacy_loop() -> Result<()> {
     let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", None::<&str>)]);
     assert_cursor_transport_precedes_capability_queries(false).await
+}
+
+async fn assert_cursor_resume_failure_is_terminal(use_state_machine: bool) -> Result<()> {
+    let (agent, provider, session_id, _temp_dir) = agent_with_prepare_failure_provider().await?;
+    let session_config = SessionConfig {
+        id: session_id,
+        schedule_id: None,
+        max_turns: Some(2),
+        retry_config: None,
+    };
+    let user_message = Message::user().with_text("resume the Cursor session");
+    let cancel = Some(CancellationToken::new());
+    let result = if use_state_machine {
+        agent
+            .reply_with_state_machine(user_message, session_config, cancel)
+            .await
+    } else {
+        agent.reply(user_message, session_config, cancel).await
+    };
+    let error = match result {
+        Ok(_) => panic!("failed session preparation must stop the reply"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("Cursor ACP resume failed"));
+    assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
+    assert!(provider.saw_saved_session.load(Ordering::SeqCst));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_resume_failure_is_terminal_in_state_machine() -> Result<()> {
+    assert_cursor_resume_failure_is_terminal(true).await
+}
+
+#[tokio::test]
+async fn cursor_resume_failure_is_terminal_in_legacy_loop() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", None::<&str>)]);
+    assert_cursor_resume_failure_is_terminal(false).await
 }
 
 #[tokio::test]

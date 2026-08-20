@@ -1751,20 +1751,13 @@ impl Agent {
                 .and_then(|conversation| {
                     super::latest_provider_inference(conversation.messages(), &provider_name)
                 });
-        if let Err(error) = provider
+        provider
             .prepare_session(
                 saved_provider_inference
                     .and_then(|inference| inference.provider_session_id.as_deref()),
                 saved_provider_inference.is_some(),
             )
-            .await
-        {
-            warn!(
-                provider = provider_name,
-                %error,
-                "Could not prepare provider session; continuing with a handoff"
-            );
-        }
+            .await?;
 
         if !self.config.disable_session_naming {
             let manager = session_manager.clone();
@@ -2245,20 +2238,13 @@ impl Agent {
         let provider_name = provider.get_name().to_string();
         let saved_provider_inference =
             super::latest_provider_inference(conversation.messages(), &provider_name);
-        if let Err(error) = provider
+        provider
             .prepare_session(
                 saved_provider_inference
                     .and_then(|inference| inference.provider_session_id.as_deref()),
                 saved_provider_inference.is_some(),
             )
-            .await
-        {
-            warn!(
-                provider = provider_name,
-                %error,
-                "Could not prepare provider session; continuing with a handoff"
-            );
-        }
+            .await?;
 
         let needs_auto_compact =
             check_if_compaction_needed(provider.as_ref(), &conversation, None, &session).await?;
