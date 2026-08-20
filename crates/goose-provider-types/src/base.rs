@@ -669,6 +669,22 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Reserve a live elicitation so nothing else can cancel or consume it.
+    ///
+    /// The response must be persisted before it is delivered, and the waiter
+    /// must not be able to disappear in between — a stream dropping between the
+    /// two would leave an answer recorded that the originating agent never
+    /// received. Claiming takes the waiter out of the provider's pending set;
+    /// `release_elicitation` puts it back if the response cannot be persisted.
+    async fn claim_elicitation(&self, _request_id: &str) -> bool {
+        false
+    }
+
+    /// Return a claimed elicitation to the pending set unanswered.
+    async fn release_elicitation(&self, _request_id: &str) {}
+
+    /// Deliver a response to a claimed elicitation. Returns false when the
+    /// originating agent is no longer there to receive it.
     async fn handle_elicitation_response(
         &self,
         _request_id: &str,

@@ -272,6 +272,9 @@ pub struct AcpProvider {
     pending_confirmations:
         Arc<TokioMutex<HashMap<String, oneshot::Sender<PermissionConfirmation>>>>,
     pending_elicitations: Arc<Mutex<HashMap<String, oneshot::Sender<CreateElicitationResponse>>>>,
+    /// Waiters reserved for delivery. Held out of `pending_elicitations` so no
+    /// other path can cancel or consume one while its response is persisted.
+    claimed_elicitations: Arc<Mutex<HashMap<String, oneshot::Sender<CreateElicitationResponse>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     /// True after the first ACP prompt completes with the handoff context committed.
     /// Failed or abandoned first prompts reset this so the next prompt can retry it.
@@ -313,11 +316,15 @@ fn cancel_pending_elicitations(
 
 struct PendingElicitationGuard {
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<CreateElicitationResponse>>>>,
+    claimed: Arc<Mutex<HashMap<String, oneshot::Sender<CreateElicitationResponse>>>>,
 }
 
 impl Drop for PendingElicitationGuard {
     fn drop(&mut self) {
+        // A claimed waiter is mid-delivery, but the stream carrying its agent is
+        // gone, so it has to be released too rather than left hanging.
         cancel_pending_elicitations(&self.pending);
+        cancel_pending_elicitations(&self.claimed);
     }
 }
 
@@ -473,6 +480,7 @@ impl AcpProvider {
             session: Mutex::new(session),
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            claimed_elicitations: Arc::new(Mutex::new(HashMap::new())),
             pending_tool_updates,
             handoff_context_sent: Arc::new(AtomicBool::new(false)),
             context_size,
@@ -661,6 +669,7 @@ impl Provider for AcpProvider {
         }
 
         cancel_pending_elicitations(&self.pending_elicitations);
+        cancel_pending_elicitations(&self.claimed_elicitations);
 
         let previous_session_id = self.acp_session_id();
         let loaded = self
@@ -773,11 +782,19 @@ impl Provider for AcpProvider {
             _ => AcpElicitationAction::Cancel,
         };
 
+        // The waiter is normally reserved by `claim_elicitation`; fall back to
+        // the pending set so a caller that did not claim still behaves.
         let Some(response_tx) = self
-            .pending_elicitations
+            .claimed_elicitations
             .lock()
             .ok()
-            .and_then(|mut pending| pending.remove(request_id))
+            .and_then(|mut claimed| claimed.remove(request_id))
+            .or_else(|| {
+                self.pending_elicitations
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.remove(request_id))
+            })
         else {
             return false;
         };
@@ -791,6 +808,44 @@ impl Provider for AcpProvider {
         self.pending_elicitations
             .lock()
             .is_ok_and(|pending| pending.contains_key(request_id))
+            || self
+                .claimed_elicitations
+                .lock()
+                .is_ok_and(|claimed| claimed.contains_key(request_id))
+    }
+
+    async fn claim_elicitation(&self, request_id: &str) -> bool {
+        let Ok(mut pending) = self.pending_elicitations.lock() else {
+            return false;
+        };
+        let Some(response_tx) = pending.remove(request_id) else {
+            return false;
+        };
+        if response_tx.is_closed() {
+            // The originating agent has already gone. Refusing the claim keeps a
+            // response from being recorded against a request nothing can receive.
+            return false;
+        }
+        match self.claimed_elicitations.lock() {
+            Ok(mut claimed) => {
+                claimed.insert(request_id.to_string(), response_tx);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    async fn release_elicitation(&self, request_id: &str) {
+        let claimed = self
+            .claimed_elicitations
+            .lock()
+            .ok()
+            .and_then(|mut claimed| claimed.remove(request_id));
+        if let Some(response_tx) = claimed {
+            if let Ok(mut pending) = self.pending_elicitations.lock() {
+                pending.insert(request_id.to_string(), response_tx);
+            }
+        }
     }
 
     async fn stream(
@@ -872,6 +927,7 @@ impl Provider for AcpProvider {
 
         let pending_confirmations = self.pending_confirmations.clone();
         let pending_elicitations = self.pending_elicitations.clone();
+        let claimed_elicitations = self.claimed_elicitations.clone();
         let goose_mode = *self
             .goose_mode
             .lock()
@@ -883,6 +939,7 @@ impl Provider for AcpProvider {
         Ok(Box::pin(try_stream! {
             let _pending_elicitation_guard = PendingElicitationGuard {
                 pending: pending_elicitations.clone(),
+                claimed: claimed_elicitations.clone(),
             };
             let mut suppress_text = false;
             let mut bare_retry = bare_retry;
@@ -2444,6 +2501,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claiming_reserves_a_waiter_until_it_is_delivered_or_released() {
+        let (provider, _) = test_provider();
+        let (response_tx, response_rx) = oneshot::channel();
+        provider
+            .pending_elicitations
+            .lock()
+            .unwrap()
+            .insert("request-1".to_string(), response_tx);
+
+        // A claim takes the waiter out of reach: nothing else can consume it, and
+        // a second submitter cannot claim it either.
+        assert!(provider.claim_elicitation("request-1").await);
+        assert!(!provider.claim_elicitation("request-1").await);
+        assert!(provider.has_pending_elicitation("request-1").await);
+        assert!(provider.pending_elicitations.lock().unwrap().is_empty());
+
+        // Releasing an unpersisted response puts it back, still unanswered.
+        provider.release_elicitation("request-1").await;
+        assert!(provider.claimed_elicitations.lock().unwrap().is_empty());
+        assert!(provider.claim_elicitation("request-1").await);
+
+        assert!(
+            provider
+                .handle_elicitation_response(
+                    "request-1",
+                    &serde_json::json!({ "answer": "delivered" }),
+                    &McpElicitationAction::Accept,
+                )
+                .await
+        );
+        let AcpElicitationAction::Accept(accept) = response_rx.await.unwrap().action else {
+            panic!("expected accepted response");
+        };
+        assert_eq!(
+            accept.content.unwrap().get("answer"),
+            Some(&ElicitationContentValue::String("delivered".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiter_whose_agent_is_gone_cannot_be_claimed() {
+        let (provider, _) = test_provider();
+        let (response_tx, response_rx) = oneshot::channel();
+        provider
+            .pending_elicitations
+            .lock()
+            .unwrap()
+            .insert("request-1".to_string(), response_tx);
+        drop(response_rx);
+
+        // Refusing the claim is what stops a response being recorded against a
+        // request that nothing is left to receive it.
+        assert!(!provider.claim_elicitation("request-1").await);
+    }
+
+    #[tokio::test]
     async fn invalid_elicitation_content_keeps_the_live_request_pending() {
         let (provider, _) = test_provider();
         let (response_tx, response_rx) = oneshot::channel();
@@ -2494,6 +2607,7 @@ mod tests {
 
         drop(PendingElicitationGuard {
             pending: pending.clone(),
+            claimed: Arc::new(Mutex::new(HashMap::new())),
         });
 
         assert!(pending.lock().unwrap().is_empty());
@@ -2908,6 +3022,7 @@ mod tests {
                 }),
                 pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
                 pending_elicitations: Arc::new(Mutex::new(HashMap::new())),
+                claimed_elicitations: Arc::new(Mutex::new(HashMap::new())),
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 handoff_context_sent: Arc::new(AtomicBool::new(false)),
                 context_size: Arc::new(AtomicU64::new(0)),

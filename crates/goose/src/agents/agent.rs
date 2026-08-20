@@ -1899,17 +1899,15 @@ impl Agent {
         response: ElicitationOutcome,
         response_message: Option<&Message>,
     ) -> Result<bool> {
-        // Serializes concurrent submitters: without this, two clients can both observe a
-        // live request and both persist the same answer while only one wins the channel.
-        //
-        // It is not a full claim. For a provider-owned request the waiter is not reserved
-        // across the append, so a stream that drops between the liveness check and the send
-        // can leave an accepted answer in history that the nested agent never received.
-        // `ActionRequiredManager::claim_response` is the shape this path still needs.
+        // Serializes concurrent submitters so two clients cannot both persist the same
+        // answer while only one wins the channel.
         let _response_guard = self.elicitation_response_lock.lock().await;
-        if !self
-            .has_pending_elicitation(session_id, elicitation_id)
-            .await
+        let provider_owned =
+            elicitation_id.starts_with(crate::acp::ACP_PROVIDER_ELICITATION_ID_PREFIX);
+        if !provider_owned
+            && !self
+                .has_pending_elicitation(session_id, elicitation_id)
+                .await
         {
             return Ok(false);
         }
@@ -1926,17 +1924,28 @@ impl Agent {
             }
         };
 
-        if elicitation_id.starts_with(crate::acp::ACP_PROVIDER_ELICITATION_ID_PREFIX) {
+        if provider_owned {
             let provider = self
                 .provider
                 .lock()
                 .await
                 .clone()
                 .ok_or_else(|| anyhow!("Provider is not configured"))?;
-            self.config
+            // Reserve the waiter before writing anything. Claiming subsumes the liveness
+            // check and takes the waiter out of reach of cancellation, so the response
+            // cannot be recorded against a request that disappears mid-append.
+            if !provider.claim_elicitation(elicitation_id).await {
+                return Ok(false);
+            }
+            if let Err(error) = self
+                .config
                 .session_manager
                 .add_message(session_id, response_message)
-                .await?;
+                .await
+            {
+                provider.release_elicitation(elicitation_id).await;
+                return Err(error);
+            }
             if !provider
                 .handle_elicitation_response(
                     elicitation_id,

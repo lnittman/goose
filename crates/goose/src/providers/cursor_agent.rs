@@ -742,6 +742,19 @@ impl Provider for CursorAgentProvider {
         }
     }
 
+    async fn claim_elicitation(&self, request_id: &str) -> bool {
+        match self.selected_acp() {
+            Some(provider) => provider.claim_elicitation(request_id).await,
+            None => false,
+        }
+    }
+
+    async fn release_elicitation(&self, request_id: &str) {
+        if let Some(provider) = self.selected_acp() {
+            provider.release_elicitation(request_id).await;
+        }
+    }
+
     async fn has_pending_elicitation(&self, request_id: &str) -> bool {
         match self.selected_acp() {
             Some(provider) => provider.has_pending_elicitation(request_id).await,
