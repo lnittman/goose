@@ -1899,9 +1899,13 @@ impl Agent {
         response: ElicitationOutcome,
         response_message: Option<&Message>,
     ) -> Result<bool> {
-        // Checking liveness, persisting the response, and consuming the waiter must be one
-        // operation. Otherwise two clients can both observe a live request and persist the
-        // same answer before only one of them wins the response channel.
+        // Serializes concurrent submitters: without this, two clients can both observe a
+        // live request and both persist the same answer while only one wins the channel.
+        //
+        // It is not a full claim. For a provider-owned request the waiter is not reserved
+        // across the append, so a stream that drops between the liveness check and the send
+        // can leave an accepted answer in history that the nested agent never received.
+        // `ActionRequiredManager::claim_response` is the shape this path still needs.
         let _response_guard = self.elicitation_response_lock.lock().await;
         if !self
             .has_pending_elicitation(session_id, elicitation_id)
