@@ -438,26 +438,6 @@ impl Inference<Session, GooseEffect> for InferenceRunner<'_> {
                 .get_context_limit(&self.model_config)
                 .await
                 .unwrap_or_else(|_| self.model_config.context_limit());
-            let provider_name = self.provider.get_name();
-            let saved_provider_inference = super::super::latest_provider_inference(
-                conversation.messages(),
-                provider_name,
-            );
-            if let Err(error) = self
-                .provider
-                .prepare_session(
-                    saved_provider_inference
-                        .and_then(|inference| inference.provider_session_id.as_deref()),
-                    saved_provider_inference.is_some(),
-                )
-                .await
-            {
-                tracing::warn!(
-                    provider = provider_name,
-                    %error,
-                    "Could not prepare provider session; continuing with a handoff"
-                );
-            }
             let turn = messages_since_kickoff(conversation)?;
             let turn_start = turn
                 .first()

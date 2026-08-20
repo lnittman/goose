@@ -1725,7 +1725,7 @@ impl Agent {
         let cancel = cancel_token.unwrap_or_default();
         let session_id = session_config.id.clone();
 
-        let entry_session = session_manager.get_session(&session_id, false).await?;
+        let entry_session = session_manager.get_session(&session_id, true).await?;
         if let Some(schedule_id) = session_config.schedule_id.clone() {
             session_manager
                 .update(&session_id)
@@ -1743,6 +1743,28 @@ impl Agent {
             .await
             .clone()
             .ok_or_else(|| anyhow!("Provider not set"))?;
+        let provider_name = provider.get_name().to_string();
+        let saved_provider_inference =
+            entry_session
+                .conversation
+                .as_ref()
+                .and_then(|conversation| {
+                    super::latest_provider_inference(conversation.messages(), &provider_name)
+                });
+        if let Err(error) = provider
+            .prepare_session(
+                saved_provider_inference
+                    .and_then(|inference| inference.provider_session_id.as_deref()),
+                saved_provider_inference.is_some(),
+            )
+            .await
+        {
+            warn!(
+                provider = provider_name,
+                %error,
+                "Could not prepare provider session; continuing with a handoff"
+            );
+        }
 
         if !self.config.disable_session_naming {
             let manager = session_manager.clone();
@@ -2219,14 +2241,27 @@ impl Agent {
             .conversation
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
+        let provider = self.provider().await?;
+        let provider_name = provider.get_name().to_string();
+        let saved_provider_inference =
+            super::latest_provider_inference(conversation.messages(), &provider_name);
+        if let Err(error) = provider
+            .prepare_session(
+                saved_provider_inference
+                    .and_then(|inference| inference.provider_session_id.as_deref()),
+                saved_provider_inference.is_some(),
+            )
+            .await
+        {
+            warn!(
+                provider = provider_name,
+                %error,
+                "Could not prepare provider session; continuing with a handoff"
+            );
+        }
 
-        let needs_auto_compact = check_if_compaction_needed(
-            self.provider().await?.as_ref(),
-            &conversation,
-            None,
-            &session,
-        )
-        .await?;
+        let needs_auto_compact =
+            check_if_compaction_needed(provider.as_ref(), &conversation, None, &session).await?;
 
         let conversation_to_compact = conversation.clone();
         let reply_span = tracing::Span::current();
@@ -2337,22 +2372,6 @@ impl Agent {
 
         let provider = self.provider().await?;
         let provider_name = provider.get_name().to_string();
-        let saved_provider_inference =
-            super::latest_provider_inference(conversation.messages(), &provider_name);
-        if let Err(error) = provider
-            .prepare_session(
-                saved_provider_inference
-                    .and_then(|inference| inference.provider_session_id.as_deref()),
-                saved_provider_inference.is_some(),
-            )
-            .await
-        {
-            warn!(
-                provider = provider_name,
-                %error,
-                "Could not prepare provider session; continuing with a handoff"
-            );
-        }
 
         let requested_model = model_config.model_name.clone();
         let resolved_model = provider

@@ -1,6 +1,7 @@
 //! Covers `Agent::reply_with_state_machine`, the entry point the CLI and desktop
 //! reach when the state machine is enabled.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use crate::agents::{Agent, AgentConfig, AgentEvent, GoosePlatform, SessionConfig
 use crate::config::permission::PermissionManager;
 use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent};
-use crate::providers::base::{MessageStream, Provider};
+use crate::providers::base::{MessageStream, PermissionRouting, Provider};
 use crate::session::{SessionManager, SessionType};
 use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
@@ -127,6 +128,94 @@ impl Provider for NestedElicitationProvider {
     }
 }
 
+struct ActivationSensitiveProvider {
+    armed: AtomicBool,
+    prepared: AtomicBool,
+    prepare_calls: AtomicUsize,
+    queried_before_prepare: AtomicBool,
+    context_queried_after_prepare: AtomicBool,
+}
+
+impl ActivationSensitiveProvider {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            prepared: AtomicBool::new(false),
+            prepare_calls: AtomicUsize::new(0),
+            queried_before_prepare: AtomicBool::new(false),
+            context_queried_after_prepare: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn record_capability_query(&self) -> bool {
+        let prepared = self.prepared.load(Ordering::SeqCst);
+        if self.armed.load(Ordering::SeqCst) && !prepared {
+            self.queried_before_prepare.store(true, Ordering::SeqCst);
+        }
+        prepared
+    }
+}
+
+#[async_trait]
+impl Provider for ActivationSensitiveProvider {
+    fn get_name(&self) -> &str {
+        "cursor-activation-test"
+    }
+
+    async fn prepare_session(
+        &self,
+        _provider_session_id: Option<&str>,
+        _has_provider_history: bool,
+    ) -> Result<(), ProviderError> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        self.prepared.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn stream(
+        &self,
+        _model_config: &ModelConfig,
+        _system: &str,
+        _messages: &[Message],
+        _tools: &[Tool],
+    ) -> Result<MessageStream, ProviderError> {
+        if !self.prepared.load(Ordering::SeqCst) {
+            return Err(ProviderError::RequestFailed(
+                "stream entered before session activation".to_string(),
+            ));
+        }
+        Ok(Box::pin(async_stream::try_stream! {
+            yield (Some(Message::assistant().with_text("activated")), None);
+        }))
+    }
+
+    async fn get_context_limit(&self, _model_config: &ModelConfig) -> Result<usize, ProviderError> {
+        if self.record_capability_query() {
+            self.context_queried_after_prepare
+                .store(true, Ordering::SeqCst);
+            Ok(262_144)
+        } else {
+            Ok(8_192)
+        }
+    }
+
+    fn manages_own_context(&self) -> bool {
+        self.record_capability_query()
+    }
+
+    fn permission_routing(&self) -> PermissionRouting {
+        if self.record_capability_query() {
+            PermissionRouting::ActionRequired
+        } else {
+            PermissionRouting::Noop
+        }
+    }
+}
+
 async fn agent_with_dummy_api() -> Result<(Agent, Arc<DummyApi>, String, tempfile::TempDir)> {
     let api = Arc::new(DummyApi::start(ProviderFeatures::default()).await);
     let api_client = goose_providers::api_client::ApiClient::new_with_tls(
@@ -195,6 +284,43 @@ async fn agent_with_nested_elicitation_provider() -> Result<(Agent, String, temp
         .await?;
 
     Ok((agent, session.id, temp_dir))
+}
+
+async fn agent_with_activation_sensitive_provider() -> Result<(
+    Agent,
+    Arc<ActivationSensitiveProvider>,
+    String,
+    tempfile::TempDir,
+)> {
+    let provider = Arc::new(ActivationSensitiveProvider::new());
+    let temp_dir = tempfile::tempdir()?;
+    let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+    let session = session_manager
+        .create_session(
+            temp_dir.path().to_path_buf(),
+            "cursor-session-activation".to_string(),
+            SessionType::Hidden,
+            GooseMode::Auto,
+        )
+        .await?;
+    let agent = Agent::with_config(AgentConfig::new(
+        session_manager,
+        PermissionManager::instance(),
+        None,
+        GooseMode::Auto,
+        true,
+        GoosePlatform::GooseCli,
+    ));
+    agent
+        .update_provider(
+            provider.clone(),
+            ModelConfig::new("cursor-activation-test"),
+            &session.id,
+        )
+        .await?;
+    provider.arm();
+
+    Ok((agent, provider, session.id, temp_dir))
 }
 
 #[tokio::test]
@@ -391,6 +517,61 @@ async fn nested_provider_elicitation_persists_before_response_in_state_machine()
 async fn nested_provider_elicitation_persists_before_response_in_legacy_loop() -> Result<()> {
     let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", None::<&str>)]);
     assert_nested_provider_elicitation_order(false).await
+}
+
+async fn assert_cursor_transport_precedes_capability_queries(
+    use_state_machine: bool,
+) -> Result<()> {
+    let (agent, provider, session_id, _temp_dir) =
+        agent_with_activation_sensitive_provider().await?;
+    let session_config = SessionConfig {
+        id: session_id,
+        schedule_id: None,
+        max_turns: Some(2),
+        retry_config: None,
+    };
+    let user_message = Message::user().with_text("use the selected transport");
+    let cancel = Some(CancellationToken::new());
+    let stream = if use_state_machine {
+        agent
+            .reply_with_state_machine(user_message, session_config, cancel)
+            .await?
+    } else {
+        agent.reply(user_message, session_config, cancel).await?
+    };
+    let saw_activated = tokio::time::timeout(Duration::from_secs(30), async move {
+        tokio::pin!(stream);
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::Message(message) = event? {
+                if message.as_concat_text() == "activated" {
+                    return anyhow::Ok(true);
+                }
+            }
+        }
+        anyhow::Ok(false)
+    })
+    .await??;
+
+    assert!(saw_activated);
+    assert!(provider.prepared.load(Ordering::SeqCst));
+    assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 1);
+    assert!(provider
+        .context_queried_after_prepare
+        .load(Ordering::SeqCst));
+    assert!(!provider.queried_before_prepare.load(Ordering::SeqCst));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_transport_precedes_capability_queries_in_state_machine() -> Result<()> {
+    assert_cursor_transport_precedes_capability_queries(true).await
+}
+
+#[tokio::test]
+async fn cursor_transport_precedes_capability_queries_in_legacy_loop() -> Result<()> {
+    let _guard = env_lock::lock_env([("GOOSE_STATE_MACHINE", None::<&str>)]);
+    assert_cursor_transport_precedes_capability_queries(false).await
 }
 
 #[tokio::test]
