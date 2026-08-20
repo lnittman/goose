@@ -858,16 +858,16 @@ impl Provider for CursorAgentProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        if let Some(provider) = self.selected_transport()? {
-            return provider.stream(model_config, system, messages, tools).await;
-        }
-
         if super::cli_common::is_session_description_request(system) {
             let (message, provider_usage) = super::cli_common::generate_simple_session_description(
                 &model_config.model_name,
                 messages,
             )?;
             return Ok(stream_from_single_message(message, provider_usage));
+        }
+
+        if let Some(provider) = self.selected_transport()? {
+            return provider.stream(model_config, system, messages, tools).await;
         }
 
         let lines = self
@@ -1058,6 +1058,30 @@ printf '%s\n' '{"type":"result","result":"ok"}'
             Err(error) => error,
         };
         assert!(stream_error.to_string().contains("requires ACP"));
+    }
+
+    #[tokio::test]
+    async fn session_description_does_not_enter_selected_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = CursorAgentProvider {
+            command: recording_cli(directory.path()),
+            name: CURSOR_AGENT_PROVIDER_NAME.to_string(),
+            transport: Mutex::new(CursorTransport::Unavailable(
+                "ACP transport should not be touched".to_string(),
+            )),
+        };
+
+        let (message, _) = provider
+            .complete(
+                &ModelConfig::new(CURSOR_AGENT_DEFAULT_MODEL),
+                "Generate a title in four words or less",
+                &[Message::user().with_text("Investigate nested Cursor ACP transport")],
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(message.as_concat_text(), "Investigate nested Cursor ACP");
     }
 
     #[test]
