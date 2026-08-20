@@ -27,12 +27,16 @@ const NESTED_ELICITATION_ID: &str = "acp-provider:state-machine-test";
 
 struct NestedElicitationProvider {
     pending: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Mirrors the real provider: a claim moves the waiter out of `pending` so a
+    /// second submitter cannot take it while the first is persisting.
+    claimed: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 impl NestedElicitationProvider {
     fn new() -> Self {
         Self {
             pending: Arc::new(Mutex::new(None)),
+            claimed: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -78,7 +82,28 @@ impl Provider for NestedElicitationProvider {
     }
 
     async fn has_pending_elicitation(&self, request_id: &str) -> bool {
-        request_id == NESTED_ELICITATION_ID && self.pending.lock().await.is_some()
+        request_id == NESTED_ELICITATION_ID
+            && (self.pending.lock().await.is_some() || self.claimed.lock().await.is_some())
+    }
+
+    async fn claim_elicitation(&self, request_id: &str) -> bool {
+        if request_id != NESTED_ELICITATION_ID {
+            return false;
+        }
+        let Some(response_tx) = self.pending.lock().await.take() else {
+            return false;
+        };
+        *self.claimed.lock().await = Some(response_tx);
+        true
+    }
+
+    async fn release_elicitation(&self, request_id: &str) {
+        if request_id != NESTED_ELICITATION_ID {
+            return;
+        }
+        if let Some(response_tx) = self.claimed.lock().await.take() {
+            *self.pending.lock().await = Some(response_tx);
+        }
     }
 
     async fn handle_elicitation_response(
@@ -90,7 +115,12 @@ impl Provider for NestedElicitationProvider {
         if request_id != NESTED_ELICITATION_ID {
             return false;
         }
-        let Some(response_tx) = self.pending.lock().await.take() else {
+        let claimed = self.claimed.lock().await.take();
+        let response_tx = match claimed {
+            Some(response_tx) => Some(response_tx),
+            None => self.pending.lock().await.take(),
+        };
+        let Some(response_tx) = response_tx else {
             return false;
         };
         response_tx.send(()).is_ok()
