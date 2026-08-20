@@ -1,6 +1,5 @@
 use super::message_meta::{
-    content_chunk_for_message, merge_message_meta, message_meta_without_steer,
-    populate_output_token_limit_content,
+    content_chunk_for_message, merge_message_meta, populate_output_token_limit_content,
 };
 use super::tool_calls::conversion::{
     build_initial_tool_call_with_message_meta, tool_call_update_fields_from_response,
@@ -53,6 +52,7 @@ struct PendingFormElicitation {
     id: String,
     message: String,
     requested_schema: serde_json::Value,
+    tool_call_id: Option<String>,
     meta: Meta,
 }
 
@@ -81,6 +81,8 @@ fn pending_form_elicitations(messages: &[Message]) -> Vec<PendingFormElicitation
                     id,
                     message: elicitation_message,
                     requested_schema,
+                    tool_call_id,
+                    meta,
                 } = &action.data
                 else {
                     return None;
@@ -89,7 +91,8 @@ fn pending_form_elicitations(messages: &[Message]) -> Vec<PendingFormElicitation
                     id: id.clone(),
                     message: elicitation_message.clone(),
                     requested_schema: requested_schema.clone(),
-                    meta: message_meta_without_steer(message),
+                    tool_call_id: tool_call_id.clone(),
+                    meta: merge_message_meta(meta.clone().unwrap_or_default(), message),
                 })
             })
         })
@@ -337,6 +340,7 @@ impl GooseAcpAgent {
                     pending.id,
                     pending.message,
                     pending.requested_schema,
+                    pending.tool_call_id,
                     pending.meta,
                     true,
                 ),
@@ -586,13 +590,28 @@ mod tests {
                 rmcp::model::ElicitationAction::Accept,
             ))
         };
+        let pending_request = Message::assistant().with_content(
+            MessageContent::action_required_elicitation_with_context(
+                "pending".to_string(),
+                "Pending question".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "answer": { "type": "string" } }
+                }),
+                Some("nested-tool-call".to_string()),
+                Some(Meta::from_iter([(
+                    "nested".to_string(),
+                    serde_json::json!({ "trace": "preserve-me" }),
+                )])),
+            ),
+        );
         let conversation = Conversation::new_unvalidated([
             Message::user().with_text("old turn"),
             request("old", "Old question"),
             Message::user().with_text("current turn"),
             request("answered", "Answered question"),
             response("answered"),
-            request("pending", "Pending question"),
+            pending_request,
         ]);
 
         let pending = pending_form_elicitations(active_turn_messages(&conversation));
@@ -600,5 +619,10 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "pending");
         assert_eq!(pending[0].message, "Pending question");
+        assert_eq!(pending[0].tool_call_id.as_deref(), Some("nested-tool-call"));
+        assert_eq!(
+            pending[0].meta.get("nested"),
+            Some(&serde_json::json!({ "trace": "preserve-me" }))
+        );
     }
 }

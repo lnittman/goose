@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAction as AcpElicitationAction,
-    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Meta, SessionId,
+    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Meta, SessionId, ToolCallId,
     CLIENT_METHOD_NAMES,
 };
 use agent_client_protocol::{
@@ -18,6 +18,7 @@ pub(super) struct FormElicitation {
     elicitation_id: String,
     message: String,
     requested_schema: serde_json::Value,
+    tool_call_id: Option<String>,
     meta: Meta,
     recovered: bool,
 }
@@ -28,6 +29,7 @@ impl FormElicitation {
         elicitation_id: String,
         message: String,
         requested_schema: serde_json::Value,
+        tool_call_id: Option<String>,
         meta: Meta,
         recovered: bool,
     ) -> Self {
@@ -36,9 +38,36 @@ impl FormElicitation {
             elicitation_id,
             message,
             requested_schema,
+            tool_call_id,
             meta,
             recovered,
         }
+    }
+
+    fn request(
+        &self,
+        session_id: &str,
+        requested_schema: ElicitationSchema,
+        has_live_waiter: bool,
+    ) -> CreateElicitationRequest {
+        let mut meta = self.meta.clone();
+        add_elicitation_meta(
+            &mut meta,
+            &self.elicitation_id,
+            self.recovered,
+            if has_live_waiter {
+                "response"
+            } else {
+                "prompt"
+            },
+        );
+        let scope = ElicitationSessionScope::new(session_id.to_string())
+            .tool_call_id(self.tool_call_id.as_deref().map(ToolCallId::new));
+        CreateElicitationRequest::new(
+            ElicitationFormMode::new(scope, requested_schema),
+            self.message.clone(),
+        )
+        .meta(meta)
     }
 }
 
@@ -76,7 +105,7 @@ impl super::GooseAcpAgent {
         elicitation: FormElicitation,
     ) -> Result<(), agent_client_protocol::Error> {
         let session_id = elicitation.session_id.0.as_ref().to_string();
-        let elicitation_id = elicitation.elicitation_id;
+        let elicitation_id = elicitation.elicitation_id.clone();
         if elicitation
             .requested_schema
             .get("url")
@@ -100,7 +129,7 @@ impl super::GooseAcpAgent {
         }
 
         let requested_schema: ElicitationSchema =
-            match serde_json::from_value(elicitation.requested_schema) {
+            match serde_json::from_value(elicitation.requested_schema.clone()) {
                 Ok(schema) => schema,
                 Err(error) => {
                     finish_form_elicitation(
@@ -118,25 +147,7 @@ impl super::GooseAcpAgent {
         let has_live_waiter = agent
             .has_pending_elicitation(&session_id, &elicitation_id)
             .await;
-        let mut meta = elicitation.meta;
-        add_elicitation_meta(
-            &mut meta,
-            &elicitation_id,
-            elicitation.recovered,
-            if has_live_waiter {
-                "response"
-            } else {
-                "prompt"
-            },
-        );
-        let request = CreateElicitationRequest::new(
-            ElicitationFormMode::new(
-                ElicitationSessionScope::new(session_id.clone()),
-                requested_schema,
-            ),
-            elicitation.message,
-        )
-        .meta(meta);
+        let request = elicitation.request(&session_id, requested_schema, has_live_waiter);
 
         let callback_agent = Arc::clone(agent);
         let callback_session_id = session_id.clone();
@@ -337,6 +348,50 @@ async fn finish_form_elicitation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{ElicitationMode, ElicitationScope};
+
+    #[test]
+    fn relayed_request_preserves_nested_tool_call_and_metadata() {
+        let elicitation = FormElicitation::new(
+            SessionId::new("outer-session"),
+            "acp-provider:question-1".to_string(),
+            "Choose a direction".to_string(),
+            serde_json::json!({}),
+            Some("nested-tool-call".to_string()),
+            Meta::from_iter([(
+                "nested".to_string(),
+                serde_json::json!({ "trace": "preserve-me" }),
+            )]),
+            false,
+        );
+
+        let request = elicitation.request(
+            "outer-session",
+            ElicitationSchema::new().string("direction", true),
+            true,
+        );
+        let ElicitationMode::Form(form) = &request.mode else {
+            panic!("expected form elicitation");
+        };
+        let ElicitationScope::Session(scope) = &form.scope else {
+            panic!("expected session-scoped elicitation");
+        };
+
+        assert_eq!(scope.session_id.0.as_ref(), "outer-session");
+        assert_eq!(
+            scope
+                .tool_call_id
+                .as_ref()
+                .map(|tool_call_id| tool_call_id.0.as_ref()),
+            Some("nested-tool-call")
+        );
+        let meta = request.meta.unwrap();
+        assert_eq!(
+            meta.get("nested"),
+            Some(&serde_json::json!({ "trace": "preserve-me" }))
+        );
+        assert_eq!(meta["goose"]["elicitationId"], "acp-provider:question-1");
+    }
 
     #[test]
     fn recovered_elicitation_metadata_declares_prompt_continuation() {

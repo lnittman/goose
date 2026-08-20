@@ -2,9 +2,9 @@ use agent_client_protocol::schema::v1::{
     Annotations as AcpAnnotations, ClientCapabilities, CloseSessionRequest, ContentBlock,
     ContentChunk, CreateElicitationRequest, CreateElicitationResponse, ElicitationAcceptAction,
     ElicitationAction as AcpElicitationAction, ElicitationCapabilities, ElicitationContentValue,
-    ElicitationFormCapabilities, ElicitationMode, EnvVariable, HttpHeader, ImageContent,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, McpCapabilities, McpServer,
-    McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest,
+    ElicitationFormCapabilities, ElicitationMode, ElicitationScope, EnvVariable, HttpHeader,
+    ImageContent, InitializeRequest, InitializeResponse, LoadSessionRequest, McpCapabilities,
+    McpServer, McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     Role as AcpRole, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionModeState, SessionNotification, SessionUpdate,
@@ -2215,16 +2215,25 @@ fn build_action_required_elicitation_message(
         return None;
     };
     let requested_schema = serde_json::to_value(&form.requested_schema).ok()?;
+    let tool_call_id = match &form.scope {
+        ElicitationScope::Session(scope) => scope
+            .tool_call_id
+            .as_ref()
+            .map(|tool_call_id| tool_call_id.0.to_string()),
+        _ => None,
+    };
     let request_id = format!(
         "{}{}",
         ACP_PROVIDER_ELICITATION_ID_PREFIX,
         uuid::Uuid::new_v4()
     );
     let message = Message::assistant()
-        .with_content(MessageContent::action_required_elicitation(
+        .with_content(MessageContent::action_required_elicitation_with_context(
             request_id.clone(),
             request.message.clone(),
             requested_schema,
+            tool_call_id,
+            request.meta.clone(),
         ))
         .user_only();
 
@@ -2323,7 +2332,7 @@ mod tests {
     use agent_client_protocol::schema::v1::{
         AgentCapabilities, ElicitationFormMode, ElicitationSchema, ElicitationSessionScope,
         ErrorCode, MultiSelectPropertySchema, SessionConfigSelectOption, SessionMode,
-        SessionModeId,
+        SessionModeId, ToolCallId,
     };
 
     use test_case::test_case;
@@ -2454,11 +2463,16 @@ mod tests {
         };
         let request = CreateElicitationRequest::new(
             ElicitationFormMode::new(
-                ElicitationSessionScope::new("nested-session"),
+                ElicitationSessionScope::new("nested-session")
+                    .tool_call_id(ToolCallId::new("nested-tool-call")),
                 ElicitationSchema::new().string("answer", true),
             ),
             "Choose an answer",
-        );
+        )
+        .meta(serde_json::Map::from_iter([(
+            "nested".to_string(),
+            serde_json::json!({ "trace": "preserve-me" }),
+        )]));
         let (response_tx, response_rx) = oneshot::channel();
         prompt_tx
             .send(AcpUpdate::ElicitationRequest {
@@ -2475,11 +2489,23 @@ mod tests {
         let MessageContent::ActionRequired(action_required) = &message.content[0] else {
             panic!("expected action-required content");
         };
-        let ActionRequiredData::Elicitation { id, message, .. } = &action_required.data else {
+        let ActionRequiredData::Elicitation {
+            id,
+            message,
+            tool_call_id,
+            meta,
+            ..
+        } = &action_required.data
+        else {
             panic!("expected elicitation action-required content");
         };
         assert!(id.starts_with(ACP_PROVIDER_ELICITATION_ID_PREFIX));
         assert_eq!(message, "Choose an answer");
+        assert_eq!(tool_call_id.as_deref(), Some("nested-tool-call"));
+        assert_eq!(
+            meta.as_ref().and_then(|meta| meta.get("nested")),
+            Some(&serde_json::json!({ "trace": "preserve-me" }))
+        );
 
         assert!(
             provider
@@ -2741,6 +2767,7 @@ mod tests {
             id,
             message,
             requested_schema,
+            ..
         } = &action_required.data
         else {
             panic!("expected elicitation content");
@@ -2999,6 +3026,7 @@ mod tests {
             id,
             message,
             requested_schema,
+            ..
         } = &action_required.data
         else {
             panic!("expected elicitation content");

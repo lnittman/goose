@@ -199,6 +199,10 @@ pub enum ActionRequiredData {
         id: String,
         message: String,
         requested_schema: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_call_id: Option<String>,
+        #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+        meta: Option<ProviderMetadata>,
     },
     ElicitationResponse {
         id: String,
@@ -514,11 +518,23 @@ impl MessageContentBlock {
         message: String,
         requested_schema: serde_json::Value,
     ) -> Self {
+        Self::action_required_elicitation_with_context(id, message, requested_schema, None, None)
+    }
+
+    pub fn action_required_elicitation_with_context<S: Into<String>>(
+        id: S,
+        message: String,
+        requested_schema: serde_json::Value,
+        tool_call_id: Option<String>,
+        meta: Option<ProviderMetadata>,
+    ) -> Self {
         MessageContentBlock::ActionRequired(ActionRequired {
             data: ActionRequiredData::Elicitation {
                 id: id.into(),
                 message,
                 requested_schema,
+                tool_call_id,
+                meta,
             },
         })
     }

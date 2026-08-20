@@ -77,7 +77,7 @@ use url::Url;
 use uuid::Uuid;
 
 use self::message_meta::{
-    content_chunk_for_message, message_meta_without_steer, populate_output_token_limit_content,
+    content_chunk_for_message, merge_message_meta, populate_output_token_limit_content,
 };
 use self::tool_calls::chain::{breaks_consecutive_tool_calls, ReadyToolChain, ToolChainTracker};
 use self::tool_calls::conversion::{
@@ -1136,6 +1136,8 @@ impl GooseAcpAgent {
                     id,
                     message: elicitation_message,
                     requested_schema,
+                    tool_call_id,
+                    meta,
                 } => {
                     self.handle_form_elicitation(
                         cx,
@@ -1145,7 +1147,8 @@ impl GooseAcpAgent {
                             id.clone(),
                             elicitation_message.clone(),
                             requested_schema.clone(),
-                            message_meta_without_steer(message),
+                            tool_call_id.clone(),
+                            merge_message_meta(meta.clone().unwrap_or_default(), message),
                             false,
                         ),
                     )
