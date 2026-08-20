@@ -373,7 +373,11 @@ pub async fn spawn_acp_server_in_process(
     let provider_factory = provider_factory.unwrap_or_else(|| {
         let base_url = openai_base_url.to_string();
         Arc::new(
-            move |_provider_name, _extensions, _working_dir, _use_default_model| {
+            move |_provider_name,
+                  _extensions,
+                  _working_dir,
+                  _use_default_model,
+                  _host_capabilities| {
                 let base_url = base_url.clone();
                 Box::pin(async move {
                     let api_client = ApiClient::new_with_tls(

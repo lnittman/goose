@@ -46,7 +46,7 @@ impl Provider for MockProvider {
 
 fn mock_provider_factory() -> goose::acp::server::AcpProviderFactory {
     Arc::new(
-        |provider_name, _extensions, _working_dir, _use_default_model| {
+        |provider_name, _extensions, _working_dir, _use_default_model, _host_capabilities| {
             Box::pin(async move {
                 Ok(Arc::new(MockProvider {
                     name: provider_name,
