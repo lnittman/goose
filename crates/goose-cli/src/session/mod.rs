@@ -2382,6 +2382,9 @@ fn find_elicitation_request(message: &Message) -> Option<(String, String, Value)
                 id,
                 message,
                 requested_schema,
+                // The CLI renders the prompt itself; relay correlation fields
+                // are only meaningful to the ACP forwarding path.
+                ..
             } = &action.data
             {
                 return Some((id.clone(), message.clone(), requested_schema.clone()));
