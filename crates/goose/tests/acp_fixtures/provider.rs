@@ -176,6 +176,8 @@ impl Connection for AcpProviderConnection {
         let session_models: SessionModels = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let sink_clone = notification_sink.clone();
         let provider_config = AcpProviderConfig {
+            // The fixture stands in for a host that can render forms.
+            supports_form_elicitation: true,
             command: "unused".into(),
             args: vec![],
             env: vec![],

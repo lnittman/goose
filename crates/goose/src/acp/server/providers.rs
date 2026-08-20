@@ -814,12 +814,20 @@ impl GooseAcpAgent {
         for refresh_job in refresh_plan.started.iter().cloned() {
             let provider_inventory = self.provider_inventory.clone();
             let provider_factory = Arc::clone(&self.provider_factory);
+            let host_capabilities = self.provider_host_capabilities();
             let provider_id = refresh_job.provider_id.clone();
             let identity = refresh_job.identity.clone();
             tokio::spawn(async move {
                 let mut refresh_guard = provider_inventory.refresh_guard(&identity);
                 let provider_result = AssertUnwindSafe(async {
-                    provider_factory(provider_id.clone(), Vec::new(), None, true).await
+                    provider_factory(
+                        provider_id.clone(),
+                        Vec::new(),
+                        None,
+                        true,
+                        host_capabilities,
+                    )
+                    .await
                 })
                 .catch_unwind()
                 .await;

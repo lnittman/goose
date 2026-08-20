@@ -60,10 +60,6 @@ fn message_meta(message: &Message) -> Meta {
     message_meta_with_steer(message, message.metadata.steer)
 }
 
-pub(super) fn message_meta_without_steer(message: &Message) -> Meta {
-    message_meta_with_steer(message, false)
-}
-
 pub(super) fn merge_message_meta(mut meta: Meta, message: &Message) -> Meta {
     extend_message_meta(&mut meta, message, message.metadata.steer);
     meta
@@ -126,7 +122,7 @@ mod tests {
             })),
         );
         assert_eq!(
-            message_meta_without_steer(&steer_message).get("goose"),
+            message_meta_with_steer(&steer_message, false).get("goose"),
             Some(&serde_json::json!({
                 "created": 1_700_000_000,
                 "messageId": "msg_live",

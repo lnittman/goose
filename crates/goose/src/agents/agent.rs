@@ -276,6 +276,7 @@ pub struct Agent {
     pub(super) tool_inspection_manager: ToolInspectionManager,
     pub(super) hook_manager: crate::hooks::HookManager,
     session_start_emitted: AtomicBool,
+    elicitation_response_lock: Mutex<()>,
     #[cfg(test)]
     pub(super) stop_hook_block_cap_override: Option<u32>,
     container: Mutex<Option<Container>>,
@@ -433,6 +434,7 @@ impl Agent {
                     use_login_shell_path,
                 )
             },
+            elicitation_response_lock: Mutex::new(()),
             session_start_emitted: AtomicBool::new(false),
             #[cfg(test)]
             stop_hook_block_cap_override: None,
@@ -1723,7 +1725,7 @@ impl Agent {
         let cancel = cancel_token.unwrap_or_default();
         let session_id = session_config.id.clone();
 
-        let entry_session = session_manager.get_session(&session_id, false).await?;
+        let entry_session = session_manager.get_session(&session_id, true).await?;
         if let Some(schedule_id) = session_config.schedule_id.clone() {
             session_manager
                 .update(&session_id)
@@ -1741,6 +1743,21 @@ impl Agent {
             .await
             .clone()
             .ok_or_else(|| anyhow!("Provider not set"))?;
+        let provider_name = provider.get_name().to_string();
+        let saved_provider_inference =
+            entry_session
+                .conversation
+                .as_ref()
+                .and_then(|conversation| {
+                    super::latest_provider_inference(conversation.messages(), &provider_name)
+                });
+        provider
+            .prepare_session(
+                saved_provider_inference
+                    .and_then(|inference| inference.provider_session_id.as_deref()),
+                saved_provider_inference.is_some(),
+            )
+            .await?;
 
         if !self.config.disable_session_naming {
             let manager = session_manager.clone();
@@ -1801,7 +1818,23 @@ impl Agent {
                     loop {
                         tokio::select! {
                             biased;
-                            Some(event) = rx.recv() => yield event,
+                            Some(event) = rx.recv() => {
+                                let mut persist_result = Ok(());
+                                if let AgentEvent::Message(message) = &event {
+                                    if crate::acp::is_provider_form_elicitation(message) {
+                                        // Nested ACP providers stay blocked until this
+                                        // action is answered. Persist before yielding so
+                                        // the response can never sort ahead of its request.
+                                        persist_result = session_manager
+                                            .add_message(&session_id, message)
+                                            .await;
+                                    }
+                                }
+                                if let Err(error) = persist_result {
+                                    break Err(error);
+                                }
+                                yield event
+                            },
                             result = &mut run => break result,
                         }
                     }
@@ -1810,6 +1843,11 @@ impl Agent {
                 // Without this the drain below never ends: `run` only borrows the emitter.
                 drop(emit);
                 while let Some(event) = rx.recv().await {
+                    if let AgentEvent::Message(message) = &event {
+                        if crate::acp::is_provider_form_elicitation(message) {
+                            session_manager.add_message(&session_id, message).await?;
+                        }
+                    }
                     yield event;
                 }
             }
@@ -1844,6 +1882,123 @@ impl Agent {
         // This is the single live-event identity boundary. Callers that intentionally stream
         // multiple events for one logical message must assign their shared ID before this point.
         Ok(Box::pin(events.map_ok(ensure_message_event_id)))
+    }
+
+    pub(crate) async fn has_pending_elicitation(
+        &self,
+        session_id: &str,
+        elicitation_id: &str,
+    ) -> bool {
+        if elicitation_id.starts_with(crate::acp::ACP_PROVIDER_ELICITATION_ID_PREFIX) {
+            let provider = self.provider.lock().await.clone();
+            return match provider {
+                Some(provider) => provider.has_pending_elicitation(elicitation_id).await,
+                None => false,
+            };
+        }
+
+        self.config
+            .session_manager
+            .action_required()
+            .has_pending_response(session_id, elicitation_id)
+            .await
+    }
+
+    /// Persist and deliver a form response while its original waiter is still alive.
+    /// Returns `false` when the request was recovered from history and must continue as
+    /// a normal provider prompt instead of pretending the dead waiter can be reattached.
+    pub(crate) async fn submit_elicitation_response(
+        &self,
+        session_id: &str,
+        elicitation_id: &str,
+        response: ElicitationOutcome,
+        response_message: Option<&Message>,
+    ) -> Result<bool> {
+        // Serializes concurrent submitters so two clients cannot both persist the same
+        // answer while only one wins the channel.
+        let _response_guard = self.elicitation_response_lock.lock().await;
+        let provider_owned =
+            elicitation_id.starts_with(crate::acp::ACP_PROVIDER_ELICITATION_ID_PREFIX);
+        if !provider_owned
+            && !self
+                .has_pending_elicitation(session_id, elicitation_id)
+                .await
+        {
+            return Ok(false);
+        }
+
+        let generated_message;
+        let response_message = match response_message {
+            Some(message) => message,
+            None => {
+                generated_message = crate::elicitation::generated_elicitation_response_message(
+                    elicitation_id,
+                    &response,
+                );
+                &generated_message
+            }
+        };
+
+        if provider_owned {
+            let provider = self
+                .provider
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow!("Provider is not configured"))?;
+            // Reserve the waiter before writing anything. Claiming subsumes the liveness
+            // check and takes the waiter out of reach of cancellation, so the response
+            // cannot be recorded against a request that disappears mid-append.
+            if !provider.claim_elicitation(elicitation_id).await {
+                return Ok(false);
+            }
+            if let Err(error) = self
+                .config
+                .session_manager
+                .add_message(session_id, response_message)
+                .await
+            {
+                provider.release_elicitation(elicitation_id).await;
+                return Err(error);
+            }
+            if !provider
+                .handle_elicitation_response(
+                    elicitation_id,
+                    &crate::elicitation::elicitation_response_user_data(&response),
+                    &crate::elicitation::elicitation_response_action(&response),
+                )
+                .await
+            {
+                return Err(anyhow!(
+                    "ACP provider elicitation is no longer pending: {elicitation_id}"
+                ));
+            }
+            return Ok(true);
+        }
+
+        crate::elicitation::complete_elicitation_with_message(
+            &self.config.session_manager,
+            session_id,
+            elicitation_id,
+            response,
+            response_message,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn record_recovered_elicitation_response(
+        &self,
+        session_id: &str,
+        elicitation_id: &str,
+        response: &ElicitationOutcome,
+    ) -> Result<()> {
+        let message =
+            crate::elicitation::generated_elicitation_response_message(elicitation_id, response);
+        self.config
+            .session_manager
+            .add_message(session_id, &message)
+            .await
     }
 
     async fn reply_impl(
@@ -1885,18 +2040,21 @@ impl Agent {
                         ElicitationAction::Cancel => ElicitationOutcome::Cancel,
                         _ => ElicitationOutcome::Cancel,
                     };
-                    crate::elicitation::complete_elicitation_with_message(
-                        &session_manager,
-                        &session_config.id,
-                        id,
-                        response,
-                        &user_message,
-                    )
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to submit elicitation response: {}", e);
-                        anyhow!("Failed to submit elicitation response: {}", e)
-                    })?;
+                    if !self
+                        .submit_elicitation_response(
+                            &session_config.id,
+                            id,
+                            response,
+                            Some(&user_message),
+                        )
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to submit elicitation response: {}", e);
+                            anyhow!("Failed to submit elicitation response: {}", e)
+                        })?
+                    {
+                        return Err(anyhow!("Elicitation is no longer pending: {id}"));
+                    }
                     return Ok(Box::pin(futures::stream::empty()));
                 }
             }
@@ -2076,14 +2234,20 @@ impl Agent {
             .conversation
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Session {} has no conversation", session_config.id))?;
+        let provider = self.provider().await?;
+        let provider_name = provider.get_name().to_string();
+        let saved_provider_inference =
+            super::latest_provider_inference(conversation.messages(), &provider_name);
+        provider
+            .prepare_session(
+                saved_provider_inference
+                    .and_then(|inference| inference.provider_session_id.as_deref()),
+                saved_provider_inference.is_some(),
+            )
+            .await?;
 
-        let needs_auto_compact = check_if_compaction_needed(
-            self.provider().await?.as_ref(),
-            &conversation,
-            None,
-            &session,
-        )
-        .await?;
+        let needs_auto_compact =
+            check_if_compaction_needed(provider.as_ref(), &conversation, None, &session).await?;
 
         let conversation_to_compact = conversation.clone();
         let reply_span = tracing::Span::current();
@@ -2194,17 +2358,6 @@ impl Agent {
 
         let provider = self.provider().await?;
         let provider_name = provider.get_name().to_string();
-        let saved_provider_session_id =
-            super::latest_provider_session_id(conversation.messages(), &provider_name);
-        if let Some(saved_provider_session_id) = saved_provider_session_id {
-            if let Err(error) = provider.resume(saved_provider_session_id).await {
-                warn!(
-                    provider = provider_name,
-                    %error,
-                    "Could not resume provider session; continuing with a handoff"
-                );
-            }
-        }
 
         let requested_model = model_config.model_name.clone();
         let resolved_model = provider
@@ -2551,6 +2704,18 @@ impl Agent {
                                 } else {
                                     response
                                 };
+                                let provider_form_elicitation =
+                                    crate::acp::is_provider_form_elicitation(&response);
+                                if provider_form_elicitation {
+                                    // The provider stream remains blocked until ACP returns
+                                    // the user's answer. Persist this request before exposing
+                                    // it so the independently submitted response cannot sort
+                                    // ahead of it; skip the normal end-of-stream batch below.
+                                    session_manager
+                                        .add_message(&session_config.id, &response)
+                                        .await?;
+                                    conversation.push(response.clone());
+                                }
 
                                 surfaced_thinking_in_turn |= filtered_response.content.iter().any(
                                     |content| {
@@ -2575,7 +2740,9 @@ impl Agent {
                                     if !text.is_empty() {
                                         last_assistant_text.push_str(&text);
                                     }
-                                    messages_to_add.push(response);
+                                    if !provider_form_elicitation {
+                                        messages_to_add.push(response);
+                                    }
                                     continue;
                                 }
 
@@ -4027,11 +4194,13 @@ mod tests {
         ];
 
         assert_eq!(
-            super::super::latest_provider_session_id(&messages, "claude-acp"),
+            super::super::latest_provider_inference(&messages, "claude-acp")
+                .and_then(|inference| inference.provider_session_id.as_deref()),
             Some("claude-session")
         );
         assert_eq!(
-            super::super::latest_provider_session_id(&messages, "codex-acp"),
+            super::super::latest_provider_inference(&messages, "codex-acp")
+                .and_then(|inference| inference.provider_session_id.as_deref()),
             None
         );
     }

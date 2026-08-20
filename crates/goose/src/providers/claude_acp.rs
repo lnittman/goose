@@ -9,7 +9,8 @@ use crate::acp::{
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, GooseMode};
 use crate::providers::base::{
-    current_working_dir, ProviderDef, ProviderDescriptor, ProviderMetadata,
+    current_working_dir, ProviderDef, ProviderDescriptor, ProviderHostCapabilities,
+    ProviderMetadata,
 };
 use crate::providers::catalog::ProviderSetupMetadata;
 
@@ -59,7 +60,34 @@ impl ProviderDef for ClaudeAcpProvider {
     fn from_env_with_working_dir(
         extensions: Vec<crate::config::ExtensionConfig>,
         working_dir: PathBuf,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+    ) -> BoxFuture<'static, Result<AcpProvider>> {
+        Self::from_env_with_working_dir_and_host_capabilities(
+            extensions,
+            working_dir,
+            tls_config,
+            ProviderHostCapabilities::default(),
+        )
+    }
+
+    fn from_env_with_host_capabilities(
+        extensions: Vec<crate::config::ExtensionConfig>,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<AcpProvider>> {
+        Self::from_env_with_working_dir_and_host_capabilities(
+            extensions,
+            current_working_dir(),
+            tls_config,
+            host_capabilities,
+        )
+    }
+
+    fn from_env_with_working_dir_and_host_capabilities(
+        extensions: Vec<crate::config::ExtensionConfig>,
+        working_dir: PathBuf,
         _tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
     ) -> BoxFuture<'static, Result<AcpProvider>> {
         Box::pin(async move {
             let config = Config::global();
@@ -96,10 +124,19 @@ impl ProviderDef for ClaudeAcpProvider {
                 model_config_option_id: Some("model".to_string()),
                 mode_mapping,
                 notification_callback: None,
+                supports_form_elicitation: host_capabilities.supports_form_elicitation,
             };
 
             let metadata = Self::metadata();
             AcpProvider::connect(metadata.name, goose_mode, provider_config).await
         })
+    }
+
+    fn from_env_with_default_model_and_host_capabilities(
+        extensions: Vec<crate::config::ExtensionConfig>,
+        tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<AcpProvider>> {
+        Self::from_env_with_host_capabilities(extensions, tls_config, host_capabilities)
     }
 }

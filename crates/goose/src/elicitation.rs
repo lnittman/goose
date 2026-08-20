@@ -6,14 +6,14 @@ use crate::action_required_manager::ElicitationOutcome;
 use crate::conversation::message::{Message, MessageContent};
 use crate::session::SessionManager;
 
-fn elicitation_response_user_data(response: &ElicitationOutcome) -> Value {
+pub(crate) fn elicitation_response_user_data(response: &ElicitationOutcome) -> Value {
     match response {
         ElicitationOutcome::Accept(user_data) => user_data.clone(),
         ElicitationOutcome::Decline | ElicitationOutcome::Cancel => serde_json::json!({}),
     }
 }
 
-fn elicitation_response_action(response: &ElicitationOutcome) -> ElicitationAction {
+pub(crate) fn elicitation_response_action(response: &ElicitationOutcome) -> ElicitationAction {
     match response {
         ElicitationOutcome::Accept(_) => ElicitationAction::Accept,
         ElicitationOutcome::Decline => ElicitationAction::Decline,
@@ -21,7 +21,7 @@ fn elicitation_response_action(response: &ElicitationOutcome) -> ElicitationActi
     }
 }
 
-fn generated_elicitation_response_message(
+pub(crate) fn generated_elicitation_response_message(
     elicitation_id: &str,
     response: &ElicitationOutcome,
 ) -> Message {
@@ -52,21 +52,4 @@ pub(crate) async fn complete_elicitation_with_message(
         .await?;
 
     claim.submit(response)
-}
-
-pub(crate) async fn complete_elicitation_with_generated_message(
-    session_manager: &SessionManager,
-    session_id: &str,
-    elicitation_id: &str,
-    response: ElicitationOutcome,
-) -> Result<()> {
-    let response_message = generated_elicitation_response_message(elicitation_id, &response);
-    complete_elicitation_with_message(
-        session_manager,
-        session_id,
-        elicitation_id,
-        response,
-        &response_message,
-    )
-    .await
 }

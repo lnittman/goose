@@ -38,15 +38,13 @@ pub use subagent_task_config::TaskConfig;
 pub use tool_execution::ToolCallContext;
 pub use types::{FrontendTool, RetryConfig, SessionConfig, SuccessCheck};
 
-fn latest_provider_session_id<'a>(
+fn latest_provider_inference<'a>(
     messages: &'a [crate::conversation::message::Message],
     provider: &str,
-) -> Option<&'a str> {
+) -> Option<&'a crate::conversation::message::InferenceMetadata> {
     let inference = messages
         .iter()
         .rev()
         .find_map(|message| message.metadata.inference.as_ref())?;
-    (inference.provider == provider)
-        .then_some(inference.provider_session_id.as_deref())
-        .flatten()
+    (inference.provider == provider).then_some(inference)
 }

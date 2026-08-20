@@ -28,6 +28,13 @@ pub(crate) fn current_working_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Capabilities explicitly negotiated by the host constructing this provider.
+/// Non-hosted entry points use the false-by-default values rather than guessing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderHostCapabilities {
+    pub supports_form_elicitation: bool,
+}
+
 pub trait ProviderDef: ProviderDescriptor + Send + Sync {
     type Provider: Provider + 'static;
 
@@ -49,6 +56,29 @@ pub trait ProviderDef: ProviderDescriptor + Send + Sync {
         Self::from_env(extensions, tls_config)
     }
 
+    fn from_env_with_host_capabilities(
+        extensions: Vec<ExtensionConfig>,
+        tls_config: Option<TlsConfig>,
+        _host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<Self::Provider>>
+    where
+        Self: Sized,
+    {
+        Self::from_env(extensions, tls_config)
+    }
+
+    fn from_env_with_working_dir_and_host_capabilities(
+        extensions: Vec<ExtensionConfig>,
+        working_dir: PathBuf,
+        tls_config: Option<TlsConfig>,
+        _host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<Self::Provider>>
+    where
+        Self: Sized,
+    {
+        Self::from_env_with_working_dir(extensions, working_dir, tls_config)
+    }
+
     fn from_env_with_default_model(
         extensions: Vec<ExtensionConfig>,
         tls_config: Option<TlsConfig>,
@@ -57,5 +87,16 @@ pub trait ProviderDef: ProviderDescriptor + Send + Sync {
         Self: Sized,
     {
         Self::from_env(extensions, tls_config)
+    }
+
+    fn from_env_with_default_model_and_host_capabilities(
+        extensions: Vec<ExtensionConfig>,
+        tls_config: Option<TlsConfig>,
+        _host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<Self::Provider>>
+    where
+        Self: Sized,
+    {
+        Self::from_env_with_default_model(extensions, tls_config)
     }
 }

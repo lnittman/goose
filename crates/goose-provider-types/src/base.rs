@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::Stream;
-use rmcp::model::Tool;
+use rmcp::model::{ElicitationAction, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -462,6 +462,17 @@ pub trait Provider: Send + Sync {
         Ok(())
     }
 
+    async fn prepare_session(
+        &self,
+        provider_session_id: Option<&str>,
+        _has_provider_history: bool,
+    ) -> Result<(), ProviderError> {
+        match provider_session_id {
+            Some(session_id) => self.resume(session_id).await,
+            None => Ok(()),
+        }
+    }
+
     /// Primary streaming method that all providers must implement.
     async fn stream(
         &self,
@@ -655,6 +666,35 @@ pub trait Provider: Send + Sync {
         _request_id: &str,
         _confirmation: &PermissionConfirmation,
     ) -> bool {
+        false
+    }
+
+    /// Reserve a live elicitation so nothing else can cancel or consume it.
+    ///
+    /// The response must be persisted before it is delivered, and the waiter
+    /// must not be able to disappear in between — a stream dropping between the
+    /// two would leave an answer recorded that the originating agent never
+    /// received. Claiming takes the waiter out of the provider's pending set;
+    /// `release_elicitation` puts it back if the response cannot be persisted.
+    async fn claim_elicitation(&self, _request_id: &str) -> bool {
+        false
+    }
+
+    /// Return a claimed elicitation to the pending set unanswered.
+    async fn release_elicitation(&self, _request_id: &str) {}
+
+    /// Deliver a response to a claimed elicitation. Returns false when the
+    /// originating agent is no longer there to receive it.
+    async fn handle_elicitation_response(
+        &self,
+        _request_id: &str,
+        _user_data: &Value,
+        _action: &ElicitationAction,
+    ) -> bool {
+        false
+    }
+
+    async fn has_pending_elicitation(&self, _request_id: &str) -> bool {
         false
     }
 }

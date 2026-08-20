@@ -77,7 +77,7 @@ use url::Url;
 use uuid::Uuid;
 
 use self::message_meta::{
-    content_chunk_for_message, message_meta_without_steer, populate_output_token_limit_content,
+    content_chunk_for_message, merge_message_meta, populate_output_token_limit_content,
 };
 use self::tool_calls::chain::{breaks_consecutive_tool_calls, ReadyToolChain, ToolChainTracker};
 use self::tool_calls::conversion::{
@@ -96,6 +96,7 @@ mod diagnostics;
 mod dictation;
 mod dispatch;
 mod elicitation;
+use self::elicitation::FormElicitation;
 mod extensions;
 mod fork_session;
 mod list_sessions;
@@ -122,6 +123,7 @@ pub type AcpProviderFactory = Arc<
             Vec<ExtensionConfig>,
             Option<PathBuf>,
             bool,
+            crate::providers::base::ProviderHostCapabilities,
         ) -> BoxFuture<'static, Result<Arc<dyn Provider>>>
         + Send
         + Sync,
@@ -661,6 +663,12 @@ impl GooseAcpAgent {
             .unwrap_or(false)
     }
 
+    fn provider_host_capabilities(&self) -> crate::providers::base::ProviderHostCapabilities {
+        crate::providers::base::ProviderHostCapabilities {
+            supports_form_elicitation: self.supports_acp_elicitation(),
+        }
+    }
+
     // TODO: goose reads Paths::in_state_dir globally (e.g. RequestLog), ignoring this data_dir.
     pub async fn new(options: GooseAcpAgentOptions) -> Result<Self> {
         let session_manager = Arc::new(SessionManager::new(options.data_dir));
@@ -725,6 +733,7 @@ impl GooseAcpAgent {
             extensions,
             working_dir,
             use_default_model,
+            self.provider_host_capabilities(),
         )
         .await
     }
@@ -1127,14 +1136,21 @@ impl GooseAcpAgent {
                     id,
                     message: elicitation_message,
                     requested_schema,
+                    tool_call_id,
+                    meta,
                 } => {
                     self.handle_form_elicitation(
                         cx,
-                        session_id,
-                        id,
-                        elicitation_message,
-                        requested_schema,
-                        message_meta_without_steer(message),
+                        agent,
+                        FormElicitation::new(
+                            session_id.clone(),
+                            id.clone(),
+                            elicitation_message.clone(),
+                            requested_schema.clone(),
+                            tool_call_id.clone(),
+                            merge_message_meta(meta.clone().unwrap_or_default(), message),
+                            false,
+                        ),
                     )
                     .await?;
                 }
@@ -2817,6 +2833,52 @@ print(\"hello, world\")
         assert!(!extract_client_supports_goose_custom_notifications(
             goose_client_capabilities.as_ref()
         ));
+    }
+
+    #[tokio::test]
+    async fn provider_factory_receives_the_outer_hosts_form_capability() {
+        let root = tempfile::tempdir().unwrap();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let provider_factory: AcpProviderFactory = Arc::new(
+            move |_provider_name,
+                  _extensions,
+                  _working_dir,
+                  _use_default_model,
+                  host_capabilities| {
+                let observed_tx = observed_tx.clone();
+                Box::pin(async move {
+                    observed_tx.send(host_capabilities).unwrap();
+                    Err(anyhow::anyhow!("capability observation only"))
+                })
+            },
+        );
+        let agent = GooseAcpAgent::new(GooseAcpAgentOptions {
+            provider_factory,
+            builtin_selection: AcpBuiltinSelection::default(),
+            data_dir: root.path().to_path_buf(),
+            config_dir: root.path().to_path_buf(),
+            disable_session_naming: true,
+            goose_platform: GoosePlatform::GooseCli,
+            additional_source_roots: Vec::new(),
+            scheduler: None,
+        })
+        .await
+        .unwrap();
+
+        agent
+            .on_initialize(InitializeRequest::new(
+                agent_client_protocol::schema::ProtocolVersion::V1,
+            ))
+            .await
+            .unwrap();
+        let error = agent
+            .create_provider("test", Vec::new(), None, false)
+            .await
+            .err()
+            .expect("the observation provider should stop after recording capabilities");
+
+        assert_eq!(error.to_string(), "capability observation only");
+        assert!(!observed_rx.recv().await.unwrap().supports_form_elicitation);
     }
 
     #[test]

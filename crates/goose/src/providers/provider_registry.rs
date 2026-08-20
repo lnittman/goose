@@ -1,5 +1,8 @@
 use super::api_client::TlsConfig;
-use super::base::{ConfigKey, ModelInfo, Provider, ProviderDef, ProviderMetadata, ProviderType};
+use super::base::{
+    ConfigKey, ModelInfo, Provider, ProviderDef, ProviderHostCapabilities, ProviderMetadata,
+    ProviderType,
+};
 use super::inventory::{InventoryIdentityInput, InventoryRegistration, InventoryResolvers};
 use crate::config::{DeclarativeProviderConfig, ExtensionConfig};
 use anyhow::Result;
@@ -15,6 +18,7 @@ pub type ProviderConstructor = Arc<
             Option<PathBuf>,
             Option<TlsConfig>,
             bool,
+            ProviderHostCapabilities,
         ) -> BoxFuture<'static, Result<Arc<dyn Provider>>>
         + Send
         + Sync,
@@ -81,11 +85,46 @@ impl ProviderEntry {
         &self,
         extensions: Vec<ExtensionConfig>,
     ) -> Result<Arc<dyn Provider>> {
-        (self.constructor)(extensions, None, self.tls_config.clone(), true).await
+        self.create_with_default_model_and_host_capabilities(
+            extensions,
+            ProviderHostCapabilities::default(),
+        )
+        .await
+    }
+
+    pub async fn create_with_default_model_and_host_capabilities(
+        &self,
+        extensions: Vec<ExtensionConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> Result<Arc<dyn Provider>> {
+        (self.constructor)(
+            extensions,
+            None,
+            self.tls_config.clone(),
+            true,
+            host_capabilities,
+        )
+        .await
     }
 
     pub async fn create(&self, extensions: Vec<ExtensionConfig>) -> Result<Arc<dyn Provider>> {
-        (self.constructor)(extensions, None, self.tls_config.clone(), false).await
+        self.create_with_host_capabilities(extensions, ProviderHostCapabilities::default())
+            .await
+    }
+
+    pub async fn create_with_host_capabilities(
+        &self,
+        extensions: Vec<ExtensionConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> Result<Arc<dyn Provider>> {
+        (self.constructor)(
+            extensions,
+            None,
+            self.tls_config.clone(),
+            false,
+            host_capabilities,
+        )
+        .await
     }
 
     pub async fn create_with_working_dir(
@@ -93,11 +132,26 @@ impl ProviderEntry {
         extensions: Vec<ExtensionConfig>,
         working_dir: PathBuf,
     ) -> Result<Arc<dyn Provider>> {
+        self.create_with_working_dir_and_host_capabilities(
+            extensions,
+            working_dir,
+            ProviderHostCapabilities::default(),
+        )
+        .await
+    }
+
+    pub async fn create_with_working_dir_and_host_capabilities(
+        &self,
+        extensions: Vec<ExtensionConfig>,
+        working_dir: PathBuf,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> Result<Arc<dyn Provider>> {
         (self.constructor)(
             extensions,
             Some(working_dir),
             self.tls_config.clone(),
             false,
+            host_capabilities,
         )
         .await
     }
@@ -140,19 +194,36 @@ impl ProviderRegistry {
             name,
             ProviderEntry {
                 metadata,
-                constructor: Arc::new(|extensions, working_dir, tls_config, use_default_model| {
-                    Box::pin(async move {
-                        let provider = if use_default_model {
-                            F::from_env_with_default_model(extensions, tls_config).await?
-                        } else if let Some(working_dir) = working_dir {
-                            F::from_env_with_working_dir(extensions, working_dir, tls_config)
+                constructor: Arc::new(
+                    |extensions, working_dir, tls_config, use_default_model, host_capabilities| {
+                        Box::pin(async move {
+                            let provider = if use_default_model {
+                                F::from_env_with_default_model_and_host_capabilities(
+                                    extensions,
+                                    tls_config,
+                                    host_capabilities,
+                                )
                                 .await?
-                        } else {
-                            F::from_env(extensions, tls_config).await?
-                        };
-                        Ok(Arc::new(provider) as Arc<dyn Provider>)
-                    })
-                }),
+                            } else if let Some(working_dir) = working_dir {
+                                F::from_env_with_working_dir_and_host_capabilities(
+                                    extensions,
+                                    working_dir,
+                                    tls_config,
+                                    host_capabilities,
+                                )
+                                .await?
+                            } else {
+                                F::from_env_with_host_capabilities(
+                                    extensions,
+                                    tls_config,
+                                    host_capabilities,
+                                )
+                                .await?
+                            };
+                            Ok(Arc::new(provider) as Arc<dyn Provider>)
+                        })
+                    },
+                ),
                 inventory_identity: inventory.identity,
                 inventory_configured: inventory.configured,
                 cleanup: None,
@@ -316,13 +387,15 @@ impl ProviderRegistry {
             config.name.clone(),
             ProviderEntry {
                 metadata: custom_metadata,
-                constructor: Arc::new(move |_extensions, _working_dir, tls_config, _| {
-                    let result = constructor(tls_config);
-                    Box::pin(async move {
-                        let provider = result?;
-                        Ok(Arc::new(provider) as Arc<dyn Provider>)
-                    })
-                }),
+                constructor: Arc::new(
+                    move |_extensions, _working_dir, tls_config, _, _host_capabilities| {
+                        let result = constructor(tls_config);
+                        Box::pin(async move {
+                            let provider = result?;
+                            Ok(Arc::new(provider) as Arc<dyn Provider>)
+                        })
+                    },
+                ),
                 inventory_identity: Arc::new(inventory_identity),
                 inventory_configured: inventory_configured.unwrap_or(default_inventory_configured),
                 cleanup: None,

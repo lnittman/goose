@@ -10,7 +10,8 @@ use crate::acp::{
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, GooseMode};
 use crate::providers::base::{
-    current_working_dir, ProviderDef, ProviderDescriptor, ProviderMetadata,
+    current_working_dir, ProviderDef, ProviderDescriptor, ProviderHostCapabilities,
+    ProviderMetadata,
 };
 use crate::providers::catalog::ProviderSetupMetadata;
 
@@ -50,6 +51,7 @@ impl PiAcpProvider {
         extensions: Vec<crate::config::ExtensionConfig>,
         working_dir: PathBuf,
         use_default_model: bool,
+        host_capabilities: ProviderHostCapabilities,
     ) -> BoxFuture<'static, Result<AcpProvider>> {
         Box::pin(async move {
             let config = Config::global();
@@ -79,6 +81,7 @@ impl PiAcpProvider {
                 model_config_option_id: Some("model".to_string()),
                 mode_mapping: HashMap::new(),
                 notification_callback: None,
+                supports_form_elicitation: host_capabilities.supports_form_elicitation,
             };
 
             let metadata = Self::metadata();
@@ -102,13 +105,48 @@ impl ProviderDef for PiAcpProvider {
         working_dir: PathBuf,
         _tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> BoxFuture<'static, Result<AcpProvider>> {
-        Self::create(extensions, working_dir, false)
+        Self::create(
+            extensions,
+            working_dir,
+            false,
+            ProviderHostCapabilities::default(),
+        )
     }
 
     fn from_env_with_default_model(
         extensions: Vec<crate::config::ExtensionConfig>,
         _tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> BoxFuture<'static, Result<AcpProvider>> {
-        Self::create(extensions, current_working_dir(), true)
+        Self::create(
+            extensions,
+            current_working_dir(),
+            true,
+            ProviderHostCapabilities::default(),
+        )
+    }
+
+    fn from_env_with_host_capabilities(
+        extensions: Vec<crate::config::ExtensionConfig>,
+        _tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<AcpProvider>> {
+        Self::create(extensions, current_working_dir(), false, host_capabilities)
+    }
+
+    fn from_env_with_working_dir_and_host_capabilities(
+        extensions: Vec<crate::config::ExtensionConfig>,
+        working_dir: PathBuf,
+        _tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<AcpProvider>> {
+        Self::create(extensions, working_dir, false, host_capabilities)
+    }
+
+    fn from_env_with_default_model_and_host_capabilities(
+        extensions: Vec<crate::config::ExtensionConfig>,
+        _tls_config: Option<crate::providers::api_client::TlsConfig>,
+        host_capabilities: ProviderHostCapabilities,
+    ) -> BoxFuture<'static, Result<AcpProvider>> {
+        Self::create(extensions, current_working_dir(), true, host_capabilities)
     }
 }
